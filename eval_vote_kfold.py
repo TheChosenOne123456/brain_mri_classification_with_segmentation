@@ -1,16 +1,17 @@
 '''
-K-Fold 评估脚本：
-功能与 eval.py 类似，但支持 K-Fold 交叉验证模型。
+K-Fold 软投票评估脚本 (Late Fusion / Soft Voting)：
+- 加载已经训练好的单通道模型 (T1, T2, FLAIR)。
+- 对同一个样本，分别获取三个模型的预测概率，取平均值后进行最终决策。
 - 如果指定 --fold N，则只评估第 N 折。
 - 如果不指定 --fold，则自动评估所有 fold 并计算平均指标。
-- 支持单通道(指定--seq) 与 多通道(不指定--seq) 模型评估。
-[适配新服务器：8x RTX 3080]
 '''
 
 import argparse
 import numpy as np
+import time
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from configs.train_config import *
@@ -36,11 +37,10 @@ from sklearn.metrics import (
 )
 
 
-# ================== [新增专区] ==================
-class MultiChannelDataset(Dataset):
+# ================== [数据集专区] ==================
+class MultiSequenceDataset(Dataset):
     """
-    代理 Dataset：将多个单通道的 Dataset 在被调用时动态组合成多通道。
-    与 train_kfold.py 保持完全一致。
+    为晚期融合设计：返回三个独立的 X (各自为单通道)，而不是拼接好的。
     """
     def __init__(self, datasets_list):
         self.datasets = datasets_list
@@ -53,112 +53,91 @@ class MultiChannelDataset(Dataset):
         xs = []
         for ds in self.datasets:
             x, y, case_id = ds[idx]  
-            xs.append(x)
+            xs.append(x) # 保持独立的 [1, D, H, W]
         
-        multi_x = torch.cat(xs, dim=0)
         _, y, case_id = self.datasets[0][idx]
-        
-        return multi_x, y, case_id
+        return xs, y, case_id
 # ================================================
 
 
-def evaluate_single_fold(args_seq, model_name, fold_idx, ModelClass):
+def evaluate_vote_single_fold(model_name, fold_idx, ModelClass):
     """
-    评估单个 Fold 的核心函数
+    使用三个模型进行软投票的评估函数
     """
-    # ---------- 判断并加载数据 ----------
-    if args_seq is not None:
-        # 单通道模式
-        seq_idx = args_seq - 1
-        seq_name = ALL_SEQUENCES[seq_idx]
-        in_channels = 1
-        
-        dataset_dir = DATASET_DIRS[seq_idx] / f"fold{fold_idx}"
-        ckpt_dir = CKPT_DIRS[seq_idx] / model_name
-        ckpt_path = ckpt_dir / f"fold{fold_idx}_model_best.pth"
-
-        if not dataset_dir.exists():
-            print(f"\n[Warning] Dataset for fold {fold_idx} not found at {dataset_dir}. Skipping.")
-            return None
-        if not ckpt_path.exists():
-            print(f"\n[Warning] Checkpoint for fold {fold_idx} not found at {ckpt_path}. Skipping.")
-            return None
-            
-        test_set = load_pt_dataset(dataset_dir / "test.pt")
-        
-    else:
-        # 多通道模式
-        in_channels = len(ALL_SEQUENCES)
-        seq_name = f"Multi-Fusion ({in_channels} Channels)"
-        
-        base_ckpt_dir = CKPT_DIRS[0].parent  
-        ckpt_dir = base_ckpt_dir / "multi_channel" / model_name
-        ckpt_path = ckpt_dir / f"fold{fold_idx}_model_best.pth"
-        
-        if not ckpt_path.exists():
-            print(f"\n[Warning] Checkpoint for fold {fold_idx} not found at {ckpt_path}. Skipping.")
-            return None
-
-        test_sets_list = []
-        import time
-        print(f"  -> Loading test sets for {seq_name}... ", end="", flush=True)
-        t0 = time.time()
-        for idx, s_name in enumerate(ALL_SEQUENCES):
-            d_dir = DATASET_DIRS[idx] / f"fold{fold_idx}"
-            if not d_dir.exists():
-                print(f"\n[Warning] Dataset missing for sequence {s_name} at {d_dir}. Skipping.")
-                return None
-            test_sets_list.append(load_pt_dataset(d_dir / "test.pt"))
-        print(f"Done in {time.time()-t0:.1f}s")
-        
-        test_set = MultiChannelDataset(test_sets_list)
-
     print(f"\n{'='*20} Evaluating Fold {fold_idx} {'='*20}")
-    print(f"Mode: {seq_name} | Model: {model_name}")
+    print(f"Mode: Late Fusion (Soft Voting) | Model: {model_name}")
 
+    # ---------- 1. 加载数据 ----------
+    test_sets_list = []
+    print("  -> Loading test sets for all 3 sequences... ", end="", flush=True)
+    t0 = time.time()
+    for idx, s_name in enumerate(ALL_SEQUENCES):
+        d_dir = DATASET_DIRS[idx] / f"fold{fold_idx}"
+        if not d_dir.exists():
+            print(f"\n[Warning] Dataset missing for {s_name} at {d_dir}. Skipping fold {fold_idx}.")
+            return None
+        test_sets_list.append(load_pt_dataset(d_dir / "test.pt"))
+    print(f"Done in {time.time()-t0:.1f}s")
+    
+    test_set = MultiSequenceDataset(test_sets_list)
     test_loader = DataLoader(
-        test_set,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=NUM_WORKERS,
+        test_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS
     )
 
-    # ---------- 初始化并加载模型 ----------
-    try:
-        model = ModelClass(num_classes=NUM_CLASSES, in_channels=in_channels)
-    except TypeError:
-        print(f"[Warning] {model_name} does not accept 'in_channels'. Using default.")
-        model = ModelClass(num_classes=NUM_CLASSES)
+    # ---------- 2. 初始化并加载 3 个模型 ----------
+    models = []
+    for seq_idx, s_name in enumerate(ALL_SEQUENCES):
+        ckpt_dir = CKPT_DIRS[seq_idx] / model_name
+        ckpt_path = ckpt_dir / f"fold{fold_idx}_model_best.pth"
         
-    model = model.to(DEVICE)
-    
-    # 训练时我们保存的是 model.module (如果用了多卡)，所以这里直接加载字典是对应的
-    checkpoint = torch.load(ckpt_path, map_location=DEVICE)
-    model.load_state_dict(checkpoint["model_state"])
+        if not ckpt_path.exists():
+            print(f"\n[Warning] Model checkpoint missing for {s_name} at {ckpt_path}. Skipping fold {fold_idx}.")
+            return None
+        
+        # 实例化单通道模型
+        try:
+            model = ModelClass(num_classes=NUM_CLASSES, in_channels=1)
+        except TypeError:
+            model = ModelClass(num_classes=NUM_CLASSES)
+            
+        model = model.to(DEVICE)
+        checkpoint = torch.load(ckpt_path, map_location=DEVICE)
+        model.load_state_dict(checkpoint["model_state"])
+        
+        if torch.cuda.device_count() > 1:
+            model = nn.DataParallel(model)
+            
+        model.eval()
+        models.append(model)
+        
+    print("  -> Successfully loaded 3 models (T1, T2, FLAIR).")
 
-    # [修改点] 加载完权重后再启用 DataParallel 进行推理加速
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs for evaluation!")
-        model = nn.DataParallel(model)
-
-    model.eval()
-    criterion = nn.CrossEntropyLoss()
-
-    # ---------- 测试 ----------
+    # ---------- 3. 测试 (软投票机制) ----------
     all_preds = []
     all_labels = []
-    total_loss = 0.0
-
     misclassified_cases = []
 
+    # 注意：投票模式下不计算 Loss，因为直接比较概率
     with torch.no_grad():
-        for x, y, case_ids in test_loader:
-            x, y = x.to(DEVICE), y.to(DEVICE)
-            logits = model(x)
-            loss = criterion(logits, y)
-
-            total_loss += loss.item()
-            preds = logits.argmax(dim=1)
+        for xs, y, case_ids in test_loader:
+            y = y.to(DEVICE)
+            
+            # xs 包含 3 个 batch tensor (T1, T2, FLAIR)
+            probs = []
+            for i, x in enumerate(xs):
+                x = x.to(DEVICE)
+                logits = models[i](x)
+                # 将 logits 转换为概率分布
+                prob = F.softmax(logits, dim=1)
+                probs.append(prob)
+            
+            # --- 核心：平均概率 (Soft Voting) ---
+            # 也可以在这里改成加权平均，例如:
+            # avg_prob = 0.5 * probs[0] + 0.25 * probs[1] + 0.25 * probs[2]
+            avg_prob = (probs[0] + probs[1] + probs[2]) / 3.0
+            
+            # 最终预测结果
+            preds = avg_prob.argmax(dim=1)
 
             preds_cpu = preds.cpu().numpy()
             labels_cpu = y.cpu().numpy()
@@ -166,7 +145,7 @@ def evaluate_single_fold(args_seq, model_name, fold_idx, ModelClass):
             all_preds.extend(preds_cpu)
             all_labels.extend(labels_cpu)
 
-            # --------- 收集误判 case ---------
+            # 收集误判 case
             for cid, p, gt in zip(case_ids, preds_cpu, labels_cpu):
                 if p != gt:
                     misclassified_cases.append({
@@ -175,20 +154,17 @@ def evaluate_single_fold(args_seq, model_name, fold_idx, ModelClass):
                         "pred": int(p),
                     })
 
-    avg_loss = total_loss / len(test_loader)
-
-    # ---------- 计算指标 ----------
+    # ---------- 4. 计算指标 ----------
     acc = accuracy_score(all_labels, all_preds)
     precision = precision_score(all_labels, all_preds, average='macro', zero_division=0)
     recall = recall_score(all_labels, all_preds, average='macro', zero_division=0)
     f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
     cm = confusion_matrix(all_labels, all_preds)
 
-    # ---------- 打印结果 ----------
+    # ---------- 5. 打印结果 ----------
     print("\n===== Test Results =====")
-    print(f"Sequence      : {seq_name} (Fold {fold_idx})")
+    print(f"Sequence      : ALL (Soft Voting) (Fold {fold_idx})")
     print(f"Test samples  : {len(test_set)}")
-    print(f"Test loss     : {avg_loss:.4f}")
     print(f"Accuracy      : {acc:.4f}")
     print(f"Precision     : {precision:.4f}")
     print(f"Recall        : {recall:.4f}")
@@ -208,7 +184,7 @@ def evaluate_single_fold(args_seq, model_name, fold_idx, ModelClass):
         )
     )
 
-    # ---------- 打印误判 case ----------
+    # ---------- 6. 打印误判 case ----------
     print("\n===== Misclassified Cases =====")
     print(f"Total misclassified: {len(misclassified_cases)}")
 
@@ -225,8 +201,7 @@ def evaluate_single_fold(args_seq, model_name, fold_idx, ModelClass):
         "acc": acc,
         "precision": precision,
         "recall": recall,
-        "f1": f1,
-        "loss": avg_loss
+        "f1": f1
     }
 
 
@@ -242,14 +217,8 @@ def main(args):
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
-    if args.seq is not None:
-        seq_name = ALL_SEQUENCES[args.seq - 1]
-    else:
-        seq_name = f"Multi-Fusion ({len(ALL_SEQUENCES)} Channels)"
+    print(f"\n>>> Starting K-Fold Evaluation for: Late Fusion Soft Voting <<<")
 
-    print(f"\n>>> Starting K-Fold Evaluation for: {seq_name} <<<")
-
-    # ---------- 确定要评估的 fold 列表 ----------
     if args.fold is not None:
         folds_to_run = [args.fold]
         print(f"Mode: Single Fold Evaluation (Fold {args.fold})")
@@ -259,13 +228,12 @@ def main(args):
 
     metrics_history = []
 
-    # ---------- 循环评估 ----------
     for k in folds_to_run:
-        res = evaluate_single_fold(args.seq, model_name, k, ModelClass)
+        res = evaluate_vote_single_fold(model_name, k, ModelClass)
         if res:
             metrics_history.append(res)
     
-    # ---------- 这里如果是多折评估，打印平均值 ----------
+    # ---------- 打印综合平均报告 ----------
     if len(metrics_history) > 1:
         print("\n" + "="*50)
         print(f"   K-FOLDS AVERAGE REPORT ({len(metrics_history)} folds)   ")
@@ -283,7 +251,7 @@ def main(args):
         avg_rec = np.mean([r['recall'] for r in metrics_history])
         std_rec = np.std([r['recall'] for r in metrics_history])
 
-        print(f"Sequence      : {seq_name}")
+        print(f"Method        : Late Fusion Soft Voting")
         print(f"Model         : {model_name}")
         print("-" * 40)
         print(f"{'Metric':<15} | {'Mean':<10} | {'Std':<10}")
@@ -299,14 +267,6 @@ def main(args):
 # ================== CLI ==================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    # [修改] required=False, 允许为空以触发多通道评估
-    parser.add_argument(
-        "--seq",
-        type=int,
-        required=False,
-        default=None,
-        help="Which MRI sequence to evaluate (1~3). Leave empty for Multi-Channel.",
-    )
     parser.add_argument(
         "--model",
         type=str,
