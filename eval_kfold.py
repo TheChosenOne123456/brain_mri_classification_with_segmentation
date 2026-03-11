@@ -17,7 +17,7 @@ from configs.train_config import *
 from configs.global_config import *
 
 from models.cnn3d import Simple3DCNN
-from models.ResNet import ResNet10
+from models.ResNet import ResNet10, ResNet18
 from utils.train_and_test import set_seed, load_pt_dataset
 
 import warnings
@@ -239,6 +239,8 @@ def main(args):
         ModelClass = Simple3DCNN
     elif model_name == "ResNet":
         ModelClass = ResNet10
+    elif model_name == "ResNet18":
+        ModelClass = ResNet18
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
@@ -311,7 +313,7 @@ if __name__ == "__main__":
         "--model",
         type=str,
         required=True,
-        choices=["cnn3d", "ResNet"],
+        choices=["cnn3d", "ResNet", "ResNet18"],
         help="Which model architecture to use",
     )
     parser.add_argument(
