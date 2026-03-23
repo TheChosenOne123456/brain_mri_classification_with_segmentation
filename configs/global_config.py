@@ -6,6 +6,9 @@
 '''
 from pathlib import Path
 
+# EXPERIMENT_VERSION = "version1"   # 原版 
+EXPERIMENT_VERSION = "version2"     # 采用加强版炎症数据
+
 SEED = 42
 
 # ========== Task & Data Source ==========
@@ -27,11 +30,14 @@ CLASS_DATA_MAP = {
     #     "脑膜病变图像/脑炎次诊",
     # ],
     # 脑膜炎和脑炎暂时合并为炎症类，后续可以根据需要拆分
+    # "inflammation": [
+    #     "脑膜病变图像/脑膜炎主诊",
+    #     "脑膜病变图像/脑膜炎次诊",
+    #     "脑膜病变图像/脑炎",
+    #     "脑膜病变图像/脑炎次诊",
+    # ],
     "inflammation": [
-        "脑膜病变图像/脑膜炎主诊",
-        "脑膜病变图像/脑膜炎次诊",
-        "脑膜病变图像/脑炎",
-        "脑膜病变图像/脑炎次诊",
+        "脑膜病变图像/不明显炎症",
     ],
     "metastasis": [
         "脑膜病变图像/脑膜转移",
@@ -56,14 +62,14 @@ NUM_SEQUENCES = len(ALL_SEQUENCES)
 # ========== Paths ==========
 RAW_DATA_PATH = Path("/home/ailab/data/brainMRI/脑膜病变")    # 原始数据根目录
 # PROCESSED_DATA_PATH = "data/processed"
-PROCESSED_DATA_PATH = Path("data")
+PROCESSED_DATA_PATH = Path(f"{EXPERIMENT_VERSION}/data")
 
 # ========== Preprocessing ==========
 TARGET_SPACING = (1.0, 1.0, 1.0)  # (D, H, W)
 TARGET_SHAPE = (160, 192, 160)
 
 # ========== Dataset ==========
-DATASET_ROOT = Path("datasets")
+DATASET_ROOT = Path(f"{EXPERIMENT_VERSION}/datasets")
 TRAIN_RATIO = 0.8
 VAL_RATIO = 0.1
 
@@ -71,4 +77,4 @@ K_FOLDS = 5 # 用于交叉验证的折数
 K_FOLDS_VAL_RATIO = 0.15  # val在 train+val 中的比例
 
 # ========== Inference ==========
-INFERENCE_OUTPUT_DIR = Path("inference_outputs")
+INFERENCE_OUTPUT_DIR = Path(f"{EXPERIMENT_VERSION}/inference_outputs")

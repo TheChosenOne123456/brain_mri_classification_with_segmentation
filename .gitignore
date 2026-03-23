@@ -7,3 +7,4 @@ inference_outputs/
 train_command.sh
 eval_command.sh
 quick_command.sh
+version*/

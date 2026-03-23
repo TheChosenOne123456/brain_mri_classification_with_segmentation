@@ -1,6 +1,8 @@
 # configs/train_config.py
 from pathlib import Path
 
+from configs.global_config import *
+
 # ================== 基本训练配置 ==================
 SEED = 42
 NUM_CLASSES = 2
@@ -22,15 +24,15 @@ PATIENCE = 20  # 早停耐心值
 
 # ================== 数据集路径（与 SEQ_IDS 一一对应） ==================
 DATASET_DIRS = [
-    Path("datasets/seq1_T1"),
-    Path("datasets/seq2_T2"),
-    Path("datasets/seq3_FLAIR"),
-    # Path("datasets/seq4_DWI"),
-    # Path("datasets/seq5_+C"),
+    Path(f"{EXPERIMENT_VERSION}/datasets/seq1_T1"),
+    Path(f"{EXPERIMENT_VERSION}/datasets/seq2_T2"),
+    Path(f"{EXPERIMENT_VERSION}/datasets/seq3_FLAIR"),
+    # Path(f"{EXPERIMENT_VERSION}/datasets/seq4_DWI"),
+    # Path(f"{EXPERIMENT_VERSION}/datasets/seq5_+C"),
 ]
 
 # ================== 模型保存路径 ==================
-CKPT_ROOT = Path("checkpoints")
+CKPT_ROOT = Path(f"{EXPERIMENT_VERSION}/checkpoints")
 
 # 每个序列单独一个目录
 CKPT_DIRS = [
