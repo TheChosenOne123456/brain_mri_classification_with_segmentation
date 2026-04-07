@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 
 INDEX_FILE_NAME = "case_index.json"
+# 定义单独存放mask索引的文件名
+MASK_INDEX_FILE_NAME = "mask_index.json"
 
 def load_index(index_path: Path):
     if index_path.exists():

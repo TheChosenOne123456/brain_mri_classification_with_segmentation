@@ -79,19 +79,13 @@ def collect_cases_by_seq(seq_id: int):
 
 
 def build_dataset(cases):
-    images = []
-    labels = []
-    case_ids = []
-
-    for c in tqdm(cases, desc="  loading cases", leave=False):
-        images.append(load_nii_as_tensor(c["nii_path"]))
-        labels.append(c["label"])
-        case_ids.append(c["case_id"])
-
+    """
+    即时加载改造版：不再完整载入并拼接图像张量。
+    而是仅返回轻量级的 case 信息（包含 NIfTI 的路径）。
+    随后外层的 torch.save 只会生成几十 KB 的记录小文件。
+    """
     return {
-        "images": torch.stack(images, dim=0),   # [N, 1, D, H, W]
-        "labels": torch.tensor(labels, dtype=torch.long),
-        "case_ids": case_ids,
+        "cases": cases,
         "meta": {
             "num_samples": len(cases),
             "created_time": datetime.now().isoformat(),

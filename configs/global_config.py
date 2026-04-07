@@ -60,6 +60,13 @@ if EXPERIMENT_VERSION == "version1":
     # PROCESSED_DATA_PATH = "data/processed"
     PROCESSED_DATA_PATH = Path(f"{EXPERIMENT_VERSION}/data")
 
+    # ========== Masks ==========
+    MASK_ROOTS = [
+        Path("/home/ailab/data/brainMRI/脑炎mask"),
+        Path("/home/ailab/data/brainMRI/脑膜炎mask"),
+        Path("/home/ailab/data/brainMRI/脑膜转移mask"),
+    ]
+
     # ========== Preprocessing ==========
     TARGET_SPACING = (1.0, 1.0, 1.0)  # (D, H, W)
     TARGET_SHAPE = (160, 192, 160)

@@ -14,7 +14,7 @@ LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-5
 
 DEVICE = "cuda"   # "cuda" or "cpu"
-NUM_WORKERS = 4
+NUM_WORKERS = 32
 
 # PATIENCE = 20  # 早停耐心值
 PATIENCE = 5  # FoundationModel 训练更快，早停耐心值适当缩短
