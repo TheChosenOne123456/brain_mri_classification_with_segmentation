@@ -7,7 +7,9 @@ import argparse
 import sys
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from sklearn.metrics import f1_score
+import numpy as np
 # 引入 AMP 模块 (兼容新旧版本写法)
 try:
     from torch.amp import GradScaler, autocast
@@ -30,6 +32,43 @@ from utils.train_and_test import set_seed, load_pt_dataset
 import warnings
 warnings.filterwarnings("ignore", message="You are using `torch.load` with `weights_only=False`")
 
+def compute_dice(pred_mask, gt_mask, num_classes=3, smooth=1e-5):
+    dices = []
+    # 忽略类别 0 (背景/正常)，仅计算异常类别（如 1:炎症, 2:转移瘤）的 Dice
+    for c in range(1, num_classes):
+        pred_c = (pred_mask == c).float()
+        gt_c = (gt_mask == c).float()
+
+        intersection = (pred_c * gt_c).sum(dim=(1, 2, 3))
+        cardinality = pred_c.sum(dim=(1, 2, 3)) + gt_c.sum(dim=(1, 2, 3))
+
+        dice = (2. * intersection + smooth) / (cardinality + smooth)
+        dices.append(dice)
+    
+    return torch.stack(dices, dim=0).mean(dim=0)
+
+def compute_dice_loss(pred_logits, gt_mask, num_classes=3, smooth=1e-5):
+    # 将模型输出的通道维映射为概率分布 [B, C, D, H, W]
+    pred_probs = F.softmax(pred_logits, dim=1)
+    
+    # 将真实的标记也转为 One-hot 形式以便对应计算 [B, C, D, H, W]
+    with torch.no_grad():
+        gt_one_hot = F.one_hot(gt_mask, num_classes=num_classes).permute(0, 4, 1, 2, 3).float()
+    
+    dice_loss = 0.0
+    # 忽略类别 0 (背景)，仅去优化类别 1 和 2
+    for c in range(1, num_classes):
+        pred_c = pred_probs[:, c, ...]
+        gt_c   = gt_one_hot[:, c, ...]
+        
+        intersection = (pred_c * gt_c).sum(dim=(1, 2, 3))
+        cardinality  = pred_c.sum(dim=(1, 2, 3)) + gt_c.sum(dim=(1, 2, 3))
+        
+        dice = (2. * intersection + smooth) / (cardinality + smooth)
+        dice_loss += (1.0 - dice)  # 转化为 Loss，1 减去 Dice
+        
+    return dice_loss / (num_classes - 1)
+
 # ================== [新增专区] ==================
 class MultiChannelDataset(Dataset):
     """
@@ -46,19 +85,32 @@ class MultiChannelDataset(Dataset):
 
     def __getitem__(self, idx):
         xs = []
-        # 分别从三个 dataset 中取出数据
-        for ds in self.datasets:
-            x, y, case_id = ds[idx]  
-            # 原始 x 形状为 [1, D, H, W]
+        final_mask = None
+        final_mask_flag = None
+        final_y = None
+        final_case_id = None
+        
+        # 只需要遍历一次！绝不重复调用 ds[idx] 导致硬盘多次读取 3D 影像！
+        for i, ds in enumerate(self.datasets):
+            x, y, mask, mask_flag, case_id = ds[idx]  
             xs.append(x)
+            
+            # 初始化基础标签 (用第一个序列的数据垫底)
+            if i == 0:
+                final_y = y
+                final_case_id = case_id
+                final_mask = mask
+                final_mask_flag = mask_flag
+            
+            # 【核心修复】一旦发现当前序列（比如 FLAIR）有医生画的真实病灶 Mask，就覆盖上去！
+            if mask_flag > 0.5:
+                final_mask = mask
+                final_mask_flag = mask_flag
         
         # 在通道维度(dim=0)进行拼接：3个 [1, D, H, W] -> [3, D, H, W]
         multi_x = torch.cat(xs, dim=0)
         
-        # 标签和 case_id 使用第一个序列的即可 (必须确保数据是对齐的)
-        _, y, case_id = self.datasets[0][idx]
-        
-        return multi_x, y, case_id
+        return multi_x, final_y, final_mask, final_mask_flag, final_case_id
 # ================================================
 
 # 辅助函数：计算准确率
@@ -67,11 +119,15 @@ def calculate_accuracy(loader, model, device):
     total = 0
     model.eval()
     with torch.no_grad():
-        for x, y, _ in loader:
+        for x, y, mask, mask_flag, _ in loader:
             x, y = x.to(device), y.to(device)
             # 验证时也开启 autocast 以节省显存
             with autocast(**({'device_type': 'cuda'} if 'device' in scaler_args else {})):
-                outputs = model(x)
+                # 如果是双头模型我们这里只测分类性能，取第一个返回值
+                if hasattr(model, 'module') and isinstance(model.module, FoundationModel) or isinstance(model, FoundationModel):
+                     outputs = model(x, return_seg=False)
+                else:
+                     outputs = model(x)
             _, predicted = torch.max(outputs.data, 1)
             total += y.size(0)
             correct += (predicted == y).sum().item()
@@ -173,6 +229,14 @@ def main(args):
     print(f"Class Weights: {class_weights.tolist()}") 
 
     criterion = nn.CrossEntropyLoss(weight=class_weights)
+    
+    # 在设备上创建一个极其侧重类别 1 和 2 的权重
+    # 假设背景权重很小(0.1)，炎症权重10.0，转移瘤权重10.0
+    seg_class_weights = torch.tensor(SEG_CLASS_WEIGHTS, dtype=torch.float32).to(DEVICE)
+
+    # 应用于分割交叉熵
+    seg_criterion = nn.CrossEntropyLoss(weight=seg_class_weights, reduction='none')
+    
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
     # 初始化混合精度 Scaler
@@ -196,21 +260,56 @@ def main(args):
         
         # 进度条
         pbar = tqdm(train_loader, desc=f"Fold {current_fold} Ep {epoch}", leave=False)
-        for x, y, _ in pbar:
+        for x, y, mask, mask_flag, _ in pbar:
             x, y = x.to(DEVICE), y.to(DEVICE)
+            mask, mask_flag = mask.to(DEVICE), mask_flag.to(DEVICE)
             optimizer.zero_grad()
             
             # AMP 前向传播
             # device_type='cuda' 用于新版 torch.amp.autocast，旧版不需要参数但兼容性不同
-            # 这里做个简单的兼容处理
             if 'device' in scaler_args:
                 actx = autocast(device_type='cuda')
             else:
                 actx = autocast()
 
             with actx:
-                logits = model(x)
-                loss = criterion(logits, y)
+                if model_name == "FoundationModel":
+                    # [修复] 必须严格作为位置参数（不带 "return_seg="）传入，防止 DataParallel 解析乱套！
+                    logits, seg_logits = model(x, True)
+                    loss_cls = criterion(logits, y)
+                    
+                    # 取出没有经过reduction的各个像素的损失 (mask去掉第一维单通道的壳子)
+                    gt_mask = mask.squeeze(1)
+                    unreduced_seg_loss = seg_criterion(seg_logits, gt_mask)
+                    
+                    # 算出Batch里每张图平均的空间Loss：[B, D, H, W] -> [B]
+                    per_sample_ce_loss = unreduced_seg_loss.mean(dim=[1, 2, 3])
+                    
+                    # [新增] 算出Batch里每张图的 Dice Loss: [B]
+                    # 因为我们传入的 compute_dice_loss 会针对每张图返回平均损失，我们可以在里面稍微调整使其按样本返回，
+                    # 简便起见，这里假设 compute_dice_loss 返回的是 [B] 形状的张量（你可以修改上方公式不进行 mean(0)）
+                    
+                    # --- 为配合上方的代码，将上方 compute_dice_loss 的返回值改为不对 Batch 取平均 ---
+                    # 即 return (dice_loss / (num_classes - 1))  # 这个就是 [B] 大小的
+                    per_sample_dice_loss = compute_dice_loss(seg_logits, gt_mask, num_classes=NUM_CLASSES)
+                    
+                    # 将两个 Loss 缝合 (通常按照 1:1 的比例即可)
+                    per_sample_total_seg_loss = per_sample_ce_loss + per_sample_dice_loss
+                    
+                    # 使用 Flag 作为开关，把那些没有遮罩标注又不是正常脑炎的“伪标签图像”损失强行清零
+                    masked_seg_loss = (per_sample_total_seg_loss * mask_flag).sum()
+                    
+                    valid_mask_count = mask_flag.sum()
+                    if valid_mask_count > 0:
+                        loss_seg = masked_seg_loss / valid_mask_count
+                    else:
+                        loss_seg = 0.0
+                        
+                    loss = loss_cls + SEG_ALPHA * loss_seg
+                else:
+                    # 单任务模型
+                    logits = model(x)
+                    loss = criterion(logits, y)
             
             # AMP 反向传播
             scaler.scale(loss).backward()
@@ -225,32 +324,50 @@ def main(args):
         train_loss = total_loss / len(train_loader)
         train_acc = train_correct / train_total
 
-        # --- Val ---
+                # --- Val ---
         model.eval()
         val_loss = 0.0
         val_correct = 0
         val_total = 0
-
-        # 收集预测结果和真实标签
+        
         all_preds = []
         all_targets = []
+        
+        valid_seg_dices = []  # <--- [新增] 收集每个 Batch 的有效 Dice
 
         with torch.no_grad():
-            for x, y, _ in val_loader:
+            for x, y, mask, mask_flag, case_ids in val_loader:  # <--- [修改] 别忘了接出 case_ids 
                 x, y = x.to(DEVICE), y.to(DEVICE)
-                
-                # 验证集也开启 autocast 节省显存
+                mask, mask_flag = mask.to(DEVICE), mask_flag.to(DEVICE) # <--- [新增]
+
                 if 'device' in scaler_args:
                     actx = autocast(device_type='cuda')
                 else:
                     actx = autocast()
                 
                 with actx:
-                    logits = model(x)
+                    if model_name == "FoundationModel":
+                        # [修改] 开启验证集的分割预测 (传入 True)
+                        logits, seg_logits = model(x, True)
+                    else:
+                        logits = model(x)
+                        seg_logits = None
                     loss = criterion(logits, y)
+
+                # ----- 计算和记录验证集 Dice -----
+                if seg_logits is not None:
+                    pred_masks = seg_logits.argmax(dim=1)
+                    gt_masks = mask.squeeze(1) if mask.dim() == 5 else mask
+                    batch_dices = compute_dice(pred_masks, gt_masks, num_classes=NUM_CLASSES)
+                    
+                    for i in range(len(y)):
+                        if mask_flag[i] > 0.5: # 或者是 y[i] == 0 (因为你在 __getitem__ 里已经把正常的设为 1.0 了)
+                            valid_seg_dices.append(batch_dices[i].item())
+                # -------------------------------
                 
                 val_loss += loss.item()
                 _, predicted = torch.max(logits.data, 1)
+
 
                 all_preds.extend(predicted.cpu().numpy())
                 all_targets.extend(y.cpu().numpy())
@@ -262,10 +379,12 @@ def main(args):
         val_acc = val_correct / val_total
         val_f1 = f1_score(all_targets, all_preds, average='macro', zero_division=0)
 
+        val_dice = np.mean(valid_seg_dices) if len(valid_seg_dices) > 0 else 0.0
+
         # --- 打印格式 ---
         print(f"Epoch [{epoch}/{NUM_EPOCHS}] "
               f"train_loss: {train_loss:.4f} | train_acc: {train_acc:.4f}   "
-              f"val_loss: {val_loss:.4f} | val_acc: {val_acc:.4f} | val_f1: {val_f1:.4f}")
+              f"val_loss: {val_loss:.4f} | val_acc: {val_acc:.4f} | val_f1: {val_f1:.4f} | val_dice: {val_dice:.4f}")
 
         # --- Early Stopping check with MIN_EPOCHS ---
         if val_f1 > best_val_f1:

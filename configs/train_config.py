@@ -43,3 +43,7 @@ CKPT_DIRS = [
     # CKPT_ROOT / "seq4_DWI",
     # CKPT_ROOT / "seq5_+C",
 ]
+
+# ================== 分割相关配置 ==================
+SEG_ALPHA = 0.5  # 分割损失的权重占比
+SEG_CLASS_WEIGHTS = [0.5, 2.0, 2.0]  # 背景和病灶的权重

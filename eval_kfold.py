@@ -37,11 +37,35 @@ from sklearn.metrics import (
 )
 
 
-# ================== [新增专区] ==================
+# ================== [新增专区：Dice 计算] ==================
+def compute_dice(pred_mask, gt_mask, num_classes=3, smooth=1e-5):
+    """
+    计算整个 batch 的每个样本的平均 Dice
+    pred_mask: [B, D, H, W]
+    gt_mask: [B, D, H, W]
+    """
+    dices = []
+    # 忽略类别 0 (背景/正常)，仅计算异常类别（如 1:炎症, 2:转移瘤）的 Dice
+    for c in range(1, num_classes):
+        pred_c = (pred_mask == c).float()
+        gt_c = (gt_mask == c).float()
+
+        intersection = (pred_c * gt_c).sum(dim=(1, 2, 3))
+        cardinality = pred_c.sum(dim=(1, 2, 3)) + gt_c.sum(dim=(1, 2, 3))
+
+        dice = (2. * intersection + smooth) / (cardinality + smooth)
+        dices.append(dice)
+    
+    # 返回每个样本的平均 Dice: shape [B]
+    return torch.stack(dices, dim=0).mean(dim=0)
+# =========================================================
+
+
 class MultiChannelDataset(Dataset):
     """
     代理 Dataset：将多个单通道的 Dataset 在被调用时动态组合成多通道。
     与 train_kfold.py 保持完全一致。
+    支持兼容新版带mask的数据结构。
     """
     def __init__(self, datasets_list):
         self.datasets = datasets_list
@@ -51,16 +75,42 @@ class MultiChannelDataset(Dataset):
         return len(self.datasets[0])
 
     def __getitem__(self, idx):
+        # 取第一个序列看看结构是 3 元素还是 5 元素
+        item0 = self.datasets[0][idx]
+        has_seg_data = (len(item0) == 5)
+
         xs = []
-        for ds in self.datasets:
-            x, y, case_id = ds[idx]  
-            xs.append(x)
-        
+        final_mask = None
+        final_has_mask = None
+        final_y = None
+        final_case_id = None
+
+        for i, ds in enumerate(self.datasets):
+            item = ds[idx]
+            xs.append(item[0]) # x 是第一个元素
+
+            if i == 0:
+                final_y = item[1]
+                if has_seg_data:
+                    final_mask = item[2]
+                    final_has_mask = item[3]
+                    final_case_id = item[4]
+                else:
+                    final_case_id = item[2]
+
+            # 如果这批数据是带 Mask 的新数据，我们就要找出真正的 Mask 主人
+            if has_seg_data:
+                current_has_mask = item[3]
+                if current_has_mask > 0.5:
+                    final_mask = item[2]
+                    final_has_mask = item[3]
+
         multi_x = torch.cat(xs, dim=0)
-        _, y, case_id = self.datasets[0][idx]
-        
-        return multi_x, y, case_id
-# ================================================
+
+        if has_seg_data:
+            return multi_x, final_y, final_mask, final_has_mask, final_case_id
+        else:
+            return multi_x, final_y, final_case_id
 
 
 def evaluate_single_fold(args_seq, model_name, fold_idx, ModelClass):
@@ -149,17 +199,50 @@ def evaluate_single_fold(args_seq, model_name, fold_idx, ModelClass):
     all_preds = []
     all_labels = []
     total_loss = 0.0
-
+    
+    valid_seg_dices = []
     misclassified_cases = []
 
     with torch.no_grad():
-        for x, y, case_ids in test_loader:
+        for batch_data in test_loader:
+            has_seg_data = (len(batch_data) == 5)
+            
+            if has_seg_data:
+                x, y, masks, has_masks, case_ids = batch_data
+                masks = masks.to(DEVICE)
+            else:
+                x, y, case_ids = batch_data[:3]
+                
             x, y = x.to(DEVICE), y.to(DEVICE)
-            logits = model(x)
+            
+            # 判断是否能展开分割头（仅 FoundationModel 支持且需要开启 return_seg）
+            if model_name == "FoundationModel" and has_seg_data:
+                logits, seg_logits = model(x, True)
+            else:
+                logits = model(x)
+                seg_logits = None
+                
             loss = criterion(logits, y)
 
             total_loss += loss.item()
             preds = logits.argmax(dim=1)
+            
+            # --- 收集分割 Dice (若存在) ---
+            if seg_logits is not None and has_seg_data:
+                pred_masks = seg_logits.argmax(dim=1)
+                
+                # 自动解除多余的维度，比如 [B, 1, D, H, W] -> [B, D, H, W]
+                if masks.dim() == 5 and masks.size(1) == 1:
+                    masks = masks.squeeze(1)
+                
+                batch_dices = compute_dice(pred_masks, masks, num_classes=NUM_CLASSES)
+                
+                for i in range(len(case_ids)):
+                    y_cls = int(y[i])
+                    h_m = bool(has_masks[i])
+                    # 包含专家标注 Mask 的患者，或是本身健康的患者（天然全零Mask）
+                    if h_m or (y_cls == 0):
+                        valid_seg_dices.append(batch_dices[i].item())
 
             preds_cpu = preds.cpu().numpy()
             labels_cpu = y.cpu().numpy()
@@ -177,6 +260,7 @@ def evaluate_single_fold(args_seq, model_name, fold_idx, ModelClass):
                     })
 
     avg_loss = total_loss / len(test_loader)
+    avg_dice = np.mean(valid_seg_dices) if len(valid_seg_dices) > 0 else 0.0
 
     # ---------- 计算指标 ----------
     acc = accuracy_score(all_labels, all_preds)
@@ -194,6 +278,8 @@ def evaluate_single_fold(args_seq, model_name, fold_idx, ModelClass):
     print(f"Precision     : {precision:.4f}")
     print(f"Recall        : {recall:.4f}")
     print(f"F1-score      : {f1:.4f}")
+    if len(valid_seg_dices) > 0:
+        print(f"Seg Dice      : {avg_dice:.4f}  (Evaluated on {len(valid_seg_dices)} samples)")
 
     print("\nConfusion Matrix:")
     print(cm)
@@ -227,7 +313,8 @@ def evaluate_single_fold(args_seq, model_name, fold_idx, ModelClass):
         "precision": precision,
         "recall": recall,
         "f1": f1,
-        "loss": avg_loss
+        "loss": avg_loss,
+        "dice": avg_dice
     }
 
 
@@ -287,6 +374,10 @@ def main(args):
         
         avg_rec = np.mean([r['recall'] for r in metrics_history])
         std_rec = np.std([r['recall'] for r in metrics_history])
+        
+        has_dice = any(r['dice'] > 0 for r in metrics_history)
+        avg_dice = np.mean([r['dice'] for r in metrics_history]) if has_dice else 0.0
+        std_dice = np.std([r['dice'] for r in metrics_history]) if has_dice else 0.0
 
         print(f"Sequence      : {seq_name}")
         print(f"Model         : {model_name}")
@@ -297,6 +388,8 @@ def main(args):
         print(f"{'Precision':<15} | {avg_prec:.4f}     | ±{std_prec:.4f}")
         print(f"{'Recall':<15} | {avg_rec:.4f}     | ±{std_rec:.4f}")
         print(f"{'F1-Score':<15} | {avg_f1:.4f}     | ±{std_f1:.4f}")
+        if has_dice:
+            print(f"{'Seg Dice':<15} | {avg_dice:.4f}     | ±{std_dice:.4f}")
         print("-" * 40)
     elif len(metrics_history) == 0:
         print("\n[Error] No folds were successfully evaluated.")

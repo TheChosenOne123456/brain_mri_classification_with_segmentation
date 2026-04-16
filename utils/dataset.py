@@ -69,10 +69,17 @@ def collect_cases_by_seq(seq_id: int):
             parts = nii_file.name.split("_")
             if len(parts) >= 2:
                 case_id = parts[1]
+                
+                # 探查是否存在对应的 Mask
+                mask_file = nii_file.parent / f"case_{case_id}_{seq_id}_mask.nii.gz"
+                has_mask = mask_file.exists()
+                
                 cases[case_id] = {
                     "case_id": case_id,
                     "nii_path": nii_file,
-                    "label": label_id  # 自动通过 enumerate 获取 0, 1, 2...
+                    "label": label_id,
+                    "has_mask": has_mask,                     # <--- 新增
+                    "mask_path": mask_file if has_mask else None  # <--- 新增
                 }
 
     return cases

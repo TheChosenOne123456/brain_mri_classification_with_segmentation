@@ -53,10 +53,12 @@ class MultiSequenceDataset(Dataset):
     def __getitem__(self, idx):
         xs = []
         for ds in self.datasets:
-            x, y, case_id = ds[idx]  
+            # 必须修改解包，加上 mask_tensor 和 has_mask_flag
+            x, y, mask_tensor, has_mask_flag, case_id = ds[idx]  
             xs.append(x) # 保持独立的 [1, D, H, W]
         
-        _, y, case_id = self.datasets[0][idx]
+        # 同样这里也要适配解包
+        _, y, _, _, case_id = self.datasets[0][idx]
         return xs, y, case_id
 # ================================================
 
