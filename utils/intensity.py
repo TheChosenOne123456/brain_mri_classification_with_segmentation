@@ -13,4 +13,6 @@ def normalize_intensity(img):
         arr = (arr - mean) / std
     else:
         arr = arr - mean  # 避免除0
-    return sitk.GetImageFromArray(arr, isVector=False)
+    out = sitk.GetImageFromArray(arr, isVector=False)
+    out.CopyInformation(img)  # 还原完整的物理空间信息(Spacing, Direction, Origin)
+    return out
