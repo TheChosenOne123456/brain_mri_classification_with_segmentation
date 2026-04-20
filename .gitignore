@@ -2,9 +2,12 @@
 **/__pycache__/
 datasets/
 checkpoints/
-output_texts/
-inference_outputs/
+BLcheckpoints/
 train_command.sh
 eval_command.sh
 quick_command.sh
 version*/
+**/*cache*/
+**/*cache/
+**/*output*/
+**/*output/
