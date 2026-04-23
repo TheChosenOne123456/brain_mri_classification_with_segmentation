@@ -82,6 +82,9 @@ if EXPERIMENT_VERSION == "version1":
     # ========== Inference ==========
     INFERENCE_OUTPUT_DIR = Path(f"{EXPERIMENT_VERSION}/inference_outputs")
 
+    # ========== 分割结果保存路径 ==========
+    SEG_OUTPUT_DIR = Path(f"{EXPERIMENT_VERSION}/seg_outputs")
+
 
 
 
@@ -138,6 +141,9 @@ elif EXPERIMENT_VERSION == "version2":
 
     # ========== Inference ==========
     INFERENCE_OUTPUT_DIR = Path(f"{EXPERIMENT_VERSION}/inference_outputs")
+
+    # ========== 分割结果保存路径 ==========
+    SEG_OUTPUT_DIR = Path(f"{EXPERIMENT_VERSION}/seg_outputs")
 
 else:
     raise ValueError(f"未知的实验版本 (Unknown EXPERIMENT_VERSION): {EXPERIMENT_VERSION}")

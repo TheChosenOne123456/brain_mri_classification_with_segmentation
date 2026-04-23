@@ -103,7 +103,7 @@ def run_mlp_fold(seq_id, fold, epochs=50, lr=1e-4, batch_size=32):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     
     # --- 设置权重保存路径 ---
-    checkpoint_dir = ROOT_DIR / "BLcheckpoints" / f"seq{seq_id}_MLP"
+    checkpoint_dir = ROOT_DIR / "BLcheckpoints" / f"seq{seq_id}_{seq_name}" / "MLP"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     best_model_path = checkpoint_dir / f"fold{fold}_model_best.pth"
     
