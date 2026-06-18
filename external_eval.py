@@ -6,6 +6,11 @@
 - 直接输出该数据类别的预测分布以及整体判定准确率
 '''
 
+# /home/ailab/data/brainMRI/脑膜转移_外院测试/
+# /home/ailab/data/brainMRI/脑炎_外院测试/
+# 运行示例：
+# python external_eval.py --data_root <外部数据目录> --label <类别编号>
+
 import argparse
 import sys
 import os
@@ -75,10 +80,45 @@ def preprocess_nii_to_tensor(nii_path):
     return tensor
 
 
+def load_models_for_fold(fold_idx):
+    models = []
+    print(f"\nLoading Heterogeneous Models for fold {fold_idx}...")
+    for seq_idx, s_name in enumerate(ALL_SEQUENCES, start=1):
+        if s_name == "FLAIR":
+            ModelClass = FoundationModel
+            target_model_name = "FoundationModel"
+        else:
+            ModelClass = FoundationModel_ori
+            target_model_name = "FoundationModel_ori"
+
+        ckpt_dir = CKPT_DIRS[seq_idx - 1] / target_model_name
+        ckpt_path = ckpt_dir / f"fold{fold_idx}_model_best.pth"
+
+        if not ckpt_path.exists():
+            print(f"[Error] Checkpoint missing for Sequence {s_name}: {ckpt_path}")
+            sys.exit(1)
+
+        try:
+            model = ModelClass(num_classes=NUM_CLASSES, in_channels=1)
+        except TypeError:
+            model = ModelClass(num_classes=NUM_CLASSES)
+
+        model = model.to(DEVICE)
+
+        checkpoint = torch.load(ckpt_path, map_location=DEVICE)
+        model.load_state_dict(checkpoint["model_state"])
+        model.eval()
+        models.append(model)
+
+        print(f"  -> Successfully loaded {s_name:<5} from {ckpt_path.name}")
+
+    return models
+
+
 def main(args):
     data_root = Path(args.data_root).resolve()
     gt_label = args.label
-    fold_idx = args.fold
+    target_folds = [args.fold] if args.fold is not None else list(range(1, K_FOLDS + 1))
 
     if not data_root.exists() or not data_root.is_dir():
         print(f"[Error] Data root {data_root} does not exist or is not a directory.")
@@ -88,7 +128,7 @@ def main(args):
     print(f"\n{'='*20} External Dataset Evaluation {'='*20}")
     print(f"Dataset root : {data_root}")
     print(f"Ground Truth : {gt_label} ({gt_class_name})")
-    print(f"Using Fold   : {fold_idx}")
+    print(f"Using Folds  : {target_folds}")
     print(f"Device       : {DEVICE}")
     print(f"{'='*69}")
 
@@ -114,76 +154,66 @@ def main(args):
         
     print(f"Found {len(cases)} complete evaluation cases.")
 
-    # ================== 2. 加载选折模型 ==================
-    models = []
-    print("\nLoading Heterogeneous Models...")
-    for seq_idx, s_name in enumerate(ALL_SEQUENCES, start=1):
-        if s_name == "FLAIR":
-            ModelClass = FoundationModel
-            target_model_name = "FoundationModel"
-        else:
-            ModelClass = FoundationModel_ori
-            target_model_name = "FoundationModel_ori"
+    # ================== 2. 按 fold 加载模型并累加预测概率 ==================
+    prob_sums = {}
+    prob_counts = {}
 
-        ckpt_dir = CKPT_DIRS[seq_idx - 1] / target_model_name
-        ckpt_path = ckpt_dir / f"fold{fold_idx}_model_best.pth"
-
-        if not ckpt_path.exists():
-            print(f"[Error] Checkpoint missing for Sequence {s_name}: {ckpt_path}")
-            sys.exit(1)
-
-        try:
-            model = ModelClass(num_classes=NUM_CLASSES, in_channels=1)
-        except TypeError:
-            model = ModelClass(num_classes=NUM_CLASSES)
-
-        model = model.to(DEVICE)
-        
-        checkpoint = torch.load(ckpt_path, map_location=DEVICE)
-        model.load_state_dict(checkpoint["model_state"])
-        model.eval()
-        models.append(model)
-        
-        print(f"  -> Successfully loaded {s_name:<5} from {ckpt_path.name}")
-
-    # ================== 3. 执行评估与软投票 ==================
-    all_preds = []
-    processed_count = 0
-    
     print("\nStarting preprocessing and inference...")
-    pbar = tqdm(cases, desc=f"Evaluating out of {len(cases)} cases")
-    
-    for case_name, seq_maps in pbar:
-        tensors = []
-        valid = True
-        
-        for seq_idx in range(1, 4):
-            tensor = preprocess_nii_to_tensor(seq_maps[seq_idx])
-            if tensor is None:
-                valid = False
-                break
-            tensors.append(tensor.to(DEVICE))
-            
-        if not valid:
-            pbar.write(f"[Warning] Failed to preprocess components for {case_name}, skipping.")
+    for fold_idx in target_folds:
+        models = load_models_for_fold(fold_idx)
+        pbar = tqdm(cases, desc=f"Evaluating fold {fold_idx}")
+
+        for case_name, seq_maps in pbar:
+            tensors = []
+            valid = True
+
+            for seq_idx in range(1, 4):
+                tensor = preprocess_nii_to_tensor(seq_maps[seq_idx])
+                if tensor is None:
+                    valid = False
+                    break
+                tensors.append(tensor.to(DEVICE))
+
+            if not valid:
+                pbar.write(f"[Warning] Failed to preprocess components for {case_name}, skipping.")
+                continue
+
+            models_prob = []
+            with torch.no_grad():
+                for i in range(3):
+                    logits = models[i](tensors[i])
+                    prob = F.softmax(logits, dim=1)
+                    models_prob.append(prob)
+
+            fold_prob = (sum(models_prob) / 3.0).detach().cpu()
+            prob_sums[case_name] = fold_prob if case_name not in prob_sums else prob_sums[case_name] + fold_prob
+            prob_counts[case_name] = prob_counts.get(case_name, 0) + 1
+
+        del models
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # ================== 3. 汇总预测结果 ==================
+    all_preds = []
+    incomplete_cases = []
+
+    for case_name in sorted(prob_sums):
+        if prob_counts[case_name] != len(target_folds):
+            incomplete_cases.append(case_name)
             continue
-            
-        models_prob = []
-        with torch.no_grad():
-            for i in range(3):
-                logits = models[i](tensors[i])
-                prob = F.softmax(logits, dim=1)
-                models_prob.append(prob)
-        
-        avg_prob = sum(models_prob) / 3.0
-        
+
+        avg_prob = prob_sums[case_name] / prob_counts[case_name]
         pred = avg_prob.argmax(dim=1).item()
         all_preds.append(pred)
-        processed_count += 1
+
+    processed_count = len(all_preds)
 
     if processed_count == 0:
         print("\n[Error] No cases were successfully processed. Terminating.")
         return
+
+    if incomplete_cases:
+        print(f"\n[Warning] Skipped {len(incomplete_cases)} cases that were not processed by every requested fold.")
 
     # ================== 4. 统计与报告 ==================
     all_labels = [gt_label] * processed_count
@@ -193,7 +223,8 @@ def main(args):
     print("\n" + "="*50)
     print(f"            FINAL EXTERNAL REPORT            ")
     print("="*50)
-    print(f"Method          : Late Fusion Soft Voting")
+    print(f"Method          : Heterogeneous Late Fusion Soft Voting")
+    print(f"Folds Used      : {target_folds}")
     print(f"Target GT Label : {gt_class_name} ({gt_label})")
     print(f"Cases Evaluated : {processed_count}")
     print(f"Accuracy        : {acc * 100:.2f} %")
@@ -228,9 +259,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--fold", 
         type=int, 
-        default=1, 
+        default=None, 
         choices=range(1, K_FOLDS + 1),
-        help="Which fold checkpoints to load (default: 1)."
+        help=f"Which fold checkpoints to load. If not set, ensemble all {K_FOLDS} folds."
     )
     args = parser.parse_args()
     
