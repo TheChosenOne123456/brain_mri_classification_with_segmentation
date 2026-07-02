@@ -12,6 +12,7 @@
 # python external_eval.py --data_root <外部数据目录> --label <类别编号>
 
 import argparse
+import csv
 import sys
 import os
 import tempfile
@@ -42,6 +43,78 @@ from models.FoundationModel_ori import FoundationModel as FoundationModel_ori
 
 import warnings
 warnings.filterwarnings("ignore", message="You are using `torch.load` with `weights_only=False`")
+
+
+DIAGNOSTIC_FIELDS = [
+    "case",
+    "gt_label",
+    "gt_class",
+    "fold",
+    "level",
+    "seq_id",
+    "seq_name",
+    "model",
+    *[f"prob_{class_name}" for class_name in CLASS_NAMES],
+    "pred_label",
+    "pred_class",
+    "is_correct",
+]
+
+
+def safe_name(name):
+    return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in name)
+
+
+def probs_to_row(
+    case_name,
+    gt_label,
+    gt_class_name,
+    fold_idx,
+    level,
+    seq_id,
+    seq_name,
+    model_name,
+    probs,
+):
+    probs = probs.squeeze(0).detach().cpu().tolist()
+    pred_label = int(np.argmax(probs))
+    pred_class = CLASS_NAMES[pred_label] if pred_label < len(CLASS_NAMES) else f"Class {pred_label}"
+
+    row = {
+        "case": case_name,
+        "gt_label": gt_label,
+        "gt_class": gt_class_name,
+        "fold": fold_idx,
+        "level": level,
+        "seq_id": seq_id if seq_id is not None else "",
+        "seq_name": seq_name if seq_name is not None else "",
+        "model": model_name,
+        "pred_label": pred_label,
+        "pred_class": pred_class,
+        "is_correct": int(pred_label == gt_label),
+    }
+
+    for class_idx, class_name in enumerate(CLASS_NAMES):
+        row[f"prob_{class_name}"] = probs[class_idx] if class_idx < len(probs) else ""
+
+    return row
+
+
+def resolve_csv_path(args, data_root, target_folds, gt_label):
+    if args.csv_path:
+        return Path(args.csv_path).resolve()
+
+    folds_name = "all" if args.fold is None else str(target_folds[0])
+    filename = f"external_eval_{safe_name(data_root.name)}_label{gt_label}_folds{folds_name}.csv"
+    return (INFERENCE_OUTPUT_DIR / filename).resolve()
+
+
+def write_diagnostics_csv(csv_path, rows):
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=DIAGNOSTIC_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def preprocess_nii_to_tensor(nii_path):
@@ -119,17 +192,23 @@ def main(args):
     data_root = Path(args.data_root).resolve()
     gt_label = args.label
     target_folds = [args.fold] if args.fold is not None else list(range(1, K_FOLDS + 1))
+    csv_path = resolve_csv_path(args, data_root, target_folds, gt_label)
 
     if not data_root.exists() or not data_root.is_dir():
         print(f"[Error] Data root {data_root} does not exist or is not a directory.")
         sys.exit(1)
 
-    gt_class_name = CLASS_NAMES[gt_label] if gt_label < len(CLASS_NAMES) else f"Class {gt_label}"
+    if gt_label < 0 or gt_label >= len(CLASS_NAMES):
+        print(f"[Error] Label must be in [0, {len(CLASS_NAMES) - 1}], got {gt_label}.")
+        sys.exit(1)
+
+    gt_class_name = CLASS_NAMES[gt_label]
     print(f"\n{'='*20} External Dataset Evaluation {'='*20}")
     print(f"Dataset root : {data_root}")
     print(f"Ground Truth : {gt_label} ({gt_class_name})")
     print(f"Using Folds  : {target_folds}")
     print(f"Device       : {DEVICE}")
+    print(f"CSV Output   : {csv_path}")
     print(f"{'='*69}")
 
     # ================== 1. 扫描有效数据 ==================
@@ -157,6 +236,7 @@ def main(args):
     # ================== 2. 按 fold 加载模型并累加预测概率 ==================
     prob_sums = {}
     prob_counts = {}
+    diagnostic_rows = []
 
     print("\nStarting preprocessing and inference...")
     for fold_idx in target_folds:
@@ -184,8 +264,37 @@ def main(args):
                     logits = models[i](tensors[i])
                     prob = F.softmax(logits, dim=1)
                     models_prob.append(prob)
+                    seq_id = i + 1
+                    seq_name = ALL_SEQUENCES[i]
+                    model_name = "FoundationModel" if seq_name == "FLAIR" else "FoundationModel_ori"
+                    diagnostic_rows.append(
+                        probs_to_row(
+                            case_name=case_name,
+                            gt_label=gt_label,
+                            gt_class_name=gt_class_name,
+                            fold_idx=fold_idx,
+                            level="sequence",
+                            seq_id=seq_id,
+                            seq_name=seq_name,
+                            model_name=model_name,
+                            probs=prob,
+                        )
+                    )
 
             fold_prob = (sum(models_prob) / 3.0).detach().cpu()
+            diagnostic_rows.append(
+                probs_to_row(
+                    case_name=case_name,
+                    gt_label=gt_label,
+                    gt_class_name=gt_class_name,
+                    fold_idx=fold_idx,
+                    level="fold_vote",
+                    seq_id=None,
+                    seq_name="ALL",
+                    model_name="HeterogeneousSoftVoting",
+                    probs=fold_prob,
+                )
+            )
             prob_sums[case_name] = fold_prob if case_name not in prob_sums else prob_sums[case_name] + fold_prob
             prob_counts[case_name] = prob_counts.get(case_name, 0) + 1
 
@@ -203,6 +312,19 @@ def main(args):
             continue
 
         avg_prob = prob_sums[case_name] / prob_counts[case_name]
+        diagnostic_rows.append(
+            probs_to_row(
+                case_name=case_name,
+                gt_label=gt_label,
+                gt_class_name=gt_class_name,
+                fold_idx="ALL",
+                level="final",
+                seq_id=None,
+                seq_name="ALL",
+                model_name="HeterogeneousSoftVoting",
+                probs=avg_prob,
+            )
+        )
         pred = avg_prob.argmax(dim=1).item()
         all_preds.append(pred)
 
@@ -214,6 +336,8 @@ def main(args):
 
     if incomplete_cases:
         print(f"\n[Warning] Skipped {len(incomplete_cases)} cases that were not processed by every requested fold.")
+
+    write_diagnostics_csv(csv_path, diagnostic_rows)
 
     # ================== 4. 统计与报告 ==================
     all_labels = [gt_label] * processed_count
@@ -228,6 +352,7 @@ def main(args):
     print(f"Target GT Label : {gt_class_name} ({gt_label})")
     print(f"Cases Evaluated : {processed_count}")
     print(f"Accuracy        : {acc * 100:.2f} %")
+    print(f"Diagnostics CSV : {csv_path}")
     print("-" * 50)
     
     unique_preds, counts = np.unique(all_preds, return_counts=True)
@@ -239,6 +364,31 @@ def main(args):
     print("\nConfusion Matrix:")
     cm = confusion_matrix(all_labels, all_preds, labels=range(NUM_CLASSES))
     print(cm)
+
+    final_rows = [row for row in diagnostic_rows if row["level"] == "final"]
+    if final_rows:
+        target_prob_key = f"prob_{gt_class_name}"
+        target_probs = [float(row[target_prob_key]) for row in final_rows if row[target_prob_key] != ""]
+        metastasis_probs = []
+        if "metastasis" in CLASS_NAMES:
+            metastasis_probs = [float(row["prob_metastasis"]) for row in final_rows if row["prob_metastasis"] != ""]
+        if target_probs:
+            print("\nFinal target-class probability summary:")
+            print(
+                f"  {gt_class_name:<15}: "
+                f"mean={np.mean(target_probs):.4f}, "
+                f"std={np.std(target_probs):.4f}, "
+                f"min={np.min(target_probs):.4f}, "
+                f"max={np.max(target_probs):.4f}"
+            )
+        if metastasis_probs and gt_class_name != "metastasis":
+            print(
+                f"  {'metastasis':<15}: "
+                f"mean={np.mean(metastasis_probs):.4f}, "
+                f"std={np.std(metastasis_probs):.4f}, "
+                f"min={np.min(metastasis_probs):.4f}, "
+                f"max={np.max(metastasis_probs):.4f}"
+            )
     print("="*50 + "\n")
 
 
@@ -262,6 +412,12 @@ if __name__ == "__main__":
         default=None, 
         choices=range(1, K_FOLDS + 1),
         help=f"Which fold checkpoints to load. If not set, ensemble all {K_FOLDS} folds."
+    )
+    parser.add_argument(
+        "--csv_path",
+        type=str,
+        default=None,
+        help="Optional path for the per-case/per-sequence probability diagnostics CSV."
     )
     args = parser.parse_args()
     
