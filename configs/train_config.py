@@ -13,6 +13,10 @@ BATCH_SIZE = 8
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-5
 
+# ================== 分类损失 ==================
+CLASS_BALANCE_BETA = 0.9999
+FOCAL_GAMMA = 2.0
+
 DEVICE = "cuda"   # "cuda" or "cpu"
 NUM_WORKERS = 32
 
