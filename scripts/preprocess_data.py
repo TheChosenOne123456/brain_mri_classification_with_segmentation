@@ -3,6 +3,8 @@
 [重构版 - 功能完全复刻]
 '''
 import argparse
+import csv
+import importlib.util
 import re
 from pathlib import Path
 from tqdm import tqdm
@@ -17,17 +19,110 @@ from utils.sequences import identify_sequence
 from utils.data_scan import collect_cases
 from utils.io import load_index, save_index, INDEX_FILE_NAME
 from utils.resample import resample_image, save_image
-from utils.intensity import normalize_intensity
-from utils.spatial import center_crop_or_pad
+from utils.intensity import normalize_intensity, zero_outside_mask
+from utils.spatial import center_crop_or_pad, crop_or_pad_around_mask
+from utils.brain_extraction import dilate_mask, extract_foreground_mask_hd_bet
+from utils.preprocess_qc import validate_preprocessed_image, validate_saved_file_size
+
+
+ERROR_LOG_FIELDS = ["case_id", "case_key", "seq_id", "nii_file", "stage", "error"]
+
+
+def append_error_log(log_path, row):
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not log_path.exists()
+    with open(log_path, "a", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=ERROR_LOG_FIELDS)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def validate_preprocess_setup():
+    if BRAIN_EXTRACTOR == "hd-bet" and importlib.util.find_spec("HD_BET") is None:
+        raise RuntimeError(
+            "HD-BET is selected but not installed in the active Python environment. "
+            "Install it with `pip install hd-bet`, or set `BRAIN_EXTRACTOR = 'none'` "
+            "in configs/global_config.py to use the legacy preprocessing flow."
+        )
+
+    if BRAIN_EXTRACTOR not in {"hd-bet", "none"}:
+        raise ValueError(f"Unsupported brain extractor: {BRAIN_EXTRACTOR}")
+
+    if INTENSITY_CLIP_PERCENTILES is not None:
+        low, high = INTENSITY_CLIP_PERCENTILES
+        if not (0 <= low < high <= 100):
+            raise ValueError(
+                f"Invalid clip percentiles: {INTENSITY_CLIP_PERCENTILES}. "
+                "Expected 0 <= LOW < HIGH <= 100."
+            )
+
+    if not (0 <= PREPROCESS_MAX_ZERO_RATIO <= 1):
+        raise ValueError(
+            f"Invalid PREPROCESS_MAX_ZERO_RATIO: {PREPROCESS_MAX_ZERO_RATIO}"
+        )
+
+    if not (0 <= PREPROCESS_MIN_NONZERO_BBOX_FRACTION <= 1):
+        raise ValueError(
+            "Invalid PREPROCESS_MIN_NONZERO_BBOX_FRACTION: "
+            f"{PREPROCESS_MIN_NONZERO_BBOX_FRACTION}"
+        )
+
+
+def preprocess_image(nii_file):
+    """
+    单个 NIfTI 的预处理入口。
+
+    新流程：
+    resample -> HD-BET foreground mask -> mask 内归一化 -> mask 外置 0 -> 以 mask bbox 中心裁剪/填充。
+    旧流程可通过 global_config.py 中的 BRAIN_EXTRACTOR = "none" 回退。
+    """
+    resampled_img = resample_image(
+        nii_file,
+        target_spacing=TARGET_SPACING,
+        is_label=False,
+    )
+    if resampled_img is None:
+        return None
+
+    if BRAIN_EXTRACTOR == "none":
+        normalized_img = normalize_intensity(resampled_img)
+        return center_crop_or_pad(normalized_img, TARGET_SHAPE)
+
+    foreground_mask = extract_foreground_mask_hd_bet(
+        resampled_img,
+        device=HD_BET_DEVICE,
+        mode=HD_BET_MODE,
+        do_tta=HD_BET_TTA,
+        postprocess=True,
+        target_orientation=HD_BET_TARGET_ORIENTATION,
+        verbose=HD_BET_VERBOSE,
+    )
+    foreground_mask = dilate_mask(foreground_mask, FOREGROUND_DILATION_MM)
+
+    normalized_img = normalize_intensity(
+        resampled_img,
+        mask_img=foreground_mask,
+        clip_percentiles=INTENSITY_CLIP_PERCENTILES,
+        robust=INTENSITY_ROBUST_ZSCORE,
+    )
+
+    if FOREGROUND_ZERO_OUTSIDE:
+        normalized_img = zero_outside_mask(normalized_img, foreground_mask)
+
+    return crop_or_pad_around_mask(normalized_img, foreground_mask, TARGET_SHAPE)
 
 
 def main(args):
+    validate_preprocess_setup()
+
     # 路径解析
     raw_root = Path(args.raw_root).resolve()
     out_root = Path(args.out_root).resolve()
 
     out_root.mkdir(parents=True, exist_ok=True)
     index_path = out_root / INDEX_FILE_NAME
+    error_log_path = out_root / "preprocess_errors.csv"
 
     # ===== 读取 / 初始化 index =====
     case_index = load_index(index_path)
@@ -112,29 +207,103 @@ def main(args):
                     continue
 
                 try:
-                    # ===== 图像处理流程 (完全复刻) =====
-                    # 1. 重采样
-                    resampled_img = resample_image(nii_file, target_spacing=TARGET_SPACING, is_label=False)
-                    if resampled_img is None:
+                    fixed_img = preprocess_image(nii_file)
+                    if fixed_img is None:
                         tqdm.write(f"[Warning] Failed to load/resample file: {nii_file.resolve()} | ID: {case_id_str}")
+                        append_error_log(
+                            error_log_path,
+                            {
+                                "case_id": case_id_str,
+                                "case_key": case_key,
+                                "seq_id": seq_id,
+                                "nii_file": str(nii_file.resolve()),
+                                "stage": "load_or_resample",
+                                "error": "resample_image returned None",
+                            },
+                        )
                         continue
-                    
-                    # 2. 强度归一化
-                    normalized_img = normalize_intensity(resampled_img)
-                    
-                    # 3. 裁剪/填充
-                    fixed_img = center_crop_or_pad(normalized_img, TARGET_SHAPE)
 
-                    # 4. 保存
+                    # 保存模型输入图像；foreground mask 只在预处理过程中临时使用
                     out_name = f"case_{case_id_str}_{seq_id}.nii.gz"
                     out_path = out_root / output_class_dir / str(seq_id) / out_name
 
+                    ok, reasons = validate_preprocessed_image(
+                        fixed_img,
+                        target_shape=TARGET_SHAPE,
+                        target_spacing=TARGET_SPACING,
+                        max_zero_ratio=PREPROCESS_MAX_ZERO_RATIO,
+                        min_nonzero_bbox_fraction=PREPROCESS_MIN_NONZERO_BBOX_FRACTION,
+                    )
+                    if not ok:
+                        tqdm.write(
+                            f"[Warning] QC failed before save: {nii_file.resolve()} | "
+                            f"ID: {case_id_str} | reasons: {';'.join(reasons)}"
+                        )
+                        append_error_log(
+                            error_log_path,
+                            {
+                                "case_id": case_id_str,
+                                "case_key": case_key,
+                                "seq_id": seq_id,
+                                "nii_file": str(nii_file.resolve()),
+                                "stage": "pre_save_qc",
+                                "error": ";".join(reasons),
+                            },
+                        )
+                        continue
+
                     if not out_path.exists():
                         save_image(fixed_img, out_path)
+
+                    ok, reasons = validate_saved_file_size(
+                        out_path,
+                        min_file_size_mb=PREPROCESS_MIN_FILE_SIZE_MB,
+                    )
+                    if not ok:
+                        if out_path.exists():
+                            out_path.unlink()
+                        tqdm.write(
+                            f"[Warning] QC failed after save: {out_path.resolve()} | "
+                            f"ID: {case_id_str} | reasons: {';'.join(reasons)}"
+                        )
+                        append_error_log(
+                            error_log_path,
+                            {
+                                "case_id": case_id_str,
+                                "case_key": case_key,
+                                "seq_id": seq_id,
+                                "nii_file": str(nii_file.resolve()),
+                                "stage": "post_save_qc",
+                                "error": ";".join(reasons),
+                            },
+                        )
+                    elif reasons:
+                        append_error_log(
+                            error_log_path,
+                            {
+                                "case_id": case_id_str,
+                                "case_key": case_key,
+                                "seq_id": seq_id,
+                                "nii_file": str(nii_file.resolve()),
+                                "stage": "post_save_qc_warning",
+                                "error": ";".join(reasons),
+                            },
+                        )
                 
                 except Exception as e:
                     # 其他 Python 错误
                     tqdm.write(f"\n[Error] Unknown error processing {nii_file}: {e}")
+                    append_error_log(
+                        error_log_path,
+                        {
+                            "case_id": case_id_str,
+                            "case_key": case_key,
+                            "seq_id": seq_id,
+                            "nii_file": str(nii_file.resolve()),
+                            "stage": "exception",
+                            "error": f"{type(e).__name__}: {e}",
+                        },
+                    )
                     continue
 
     # ===== 保存索引 =====

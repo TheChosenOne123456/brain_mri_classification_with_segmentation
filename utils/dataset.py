@@ -18,7 +18,8 @@ def load_nii_as_tensor(nii_path: Path) -> torch.Tensor:
     """
     nii = nib.load(str(nii_path))
     data = nii.get_fdata(dtype=np.float32)
-    return torch.from_numpy(data).unsqueeze(0)
+    data = np.ascontiguousarray(data)
+    return torch.from_numpy(data.copy()).unsqueeze(0)
 
 
 # 目前已弃用

@@ -18,6 +18,8 @@ CLASS_BALANCE_BETA = 0.9999
 FOCAL_GAMMA = 2.0
 
 DEVICE = "cuda"   # "cuda" or "cpu"
+# 直接从 NIfTI 懒加载 3D 体数据时，多进程 DataLoader 容易出现共享内存/
+# storage 问题，先用单进程保证训练可跑通。后续如需提速，建议先做张量缓存。
 NUM_WORKERS = 32
 
 # PATIENCE = 20  # 早停耐心值

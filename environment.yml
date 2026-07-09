@@ -137,6 +137,7 @@ dependencies:
       - cycler==0.12.1
       - fonttools==4.60.2
       - fsspec==2025.10.0
+      - hd-bet
       - importlib-resources==6.5.2
       - joblib==1.5.3
       - kiwisolver==1.4.7

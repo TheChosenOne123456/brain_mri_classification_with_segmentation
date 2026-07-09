@@ -70,6 +70,19 @@ if EXPERIMENT_VERSION == "version1":
     # ========== Preprocessing ==========
     TARGET_SPACING = (1.0, 1.0, 1.0)  # (D, H, W)
     TARGET_SHAPE = (160, 192, 160)
+    BRAIN_EXTRACTOR = "hd-bet"
+    HD_BET_DEVICE = "auto"
+    HD_BET_MODE = "fast"
+    HD_BET_TTA = False
+    HD_BET_VERBOSE = False
+    HD_BET_TARGET_ORIENTATION = "RAS"
+    FOREGROUND_DILATION_MM = 5.0
+    FOREGROUND_ZERO_OUTSIDE = True
+    INTENSITY_CLIP_PERCENTILES = None
+    INTENSITY_ROBUST_ZSCORE = False
+    PREPROCESS_MIN_FILE_SIZE_MB = 0.5
+    PREPROCESS_MAX_ZERO_RATIO = 0.995
+    PREPROCESS_MIN_NONZERO_BBOX_FRACTION = 0.25
 
     # ========== Dataset ==========
     DATASET_ROOT = Path(f"{EXPERIMENT_VERSION}/datasets")
@@ -130,6 +143,19 @@ elif EXPERIMENT_VERSION == "version2":
     # ========== Preprocessing ==========
     TARGET_SPACING = (1.0, 1.0, 1.0)  # (D, H, W)
     TARGET_SHAPE = (160, 192, 160)
+    BRAIN_EXTRACTOR = "hd-bet"
+    HD_BET_DEVICE = "auto"
+    HD_BET_MODE = "fast"
+    HD_BET_TTA = False
+    HD_BET_VERBOSE = False
+    HD_BET_TARGET_ORIENTATION = "RAS"
+    FOREGROUND_DILATION_MM = 5.0
+    FOREGROUND_ZERO_OUTSIDE = True
+    INTENSITY_CLIP_PERCENTILES = None
+    INTENSITY_ROBUST_ZSCORE = False
+    PREPROCESS_MIN_FILE_SIZE_MB = 0.5
+    PREPROCESS_MAX_ZERO_RATIO = 0.995
+    PREPROCESS_MIN_NONZERO_BBOX_FRACTION = 0.25
 
     # ========== Dataset ==========
     DATASET_ROOT = Path(f"{EXPERIMENT_VERSION}/datasets")
