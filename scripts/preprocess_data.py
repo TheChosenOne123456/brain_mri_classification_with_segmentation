@@ -5,10 +5,12 @@
 import argparse
 import csv
 import importlib.util
+import json
 import re
 from pathlib import Path
 from tqdm import tqdm
 
+import numpy as np
 import SimpleITK as sitk
 # [新增] 关闭 SimpleITK 的底层警告输出，防止刷屏
 sitk.ProcessObject_SetGlobalWarningDisplay(False)
@@ -20,7 +22,7 @@ from utils.data_scan import collect_cases
 from utils.io import load_index, save_index, INDEX_FILE_NAME
 from utils.resample import resample_image, save_image
 from utils.intensity import normalize_intensity, zero_outside_mask
-from utils.spatial import center_crop_or_pad, crop_or_pad_around_mask
+from utils.spatial import center_crop_or_pad_with_meta, crop_or_pad_around_mask_with_meta
 from utils.brain_extraction import dilate_mask, extract_foreground_mask_hd_bet
 from utils.preprocess_qc import validate_preprocessed_image, validate_saved_file_size
 
@@ -36,6 +38,176 @@ def append_error_log(log_path, row):
         if write_header:
             writer.writeheader()
         writer.writerow(row)
+
+
+def nii_stem(path: Path):
+    name = path.name
+    if name.lower().endswith(".nii.gz"):
+        return name[:-7]
+    if name.lower().endswith(".nii"):
+        return name[:-4]
+    return path.stem
+
+
+def exact_sequence_names(seq_name):
+    names = {seq_name.upper()}
+    if seq_name.upper() in {"T1", "T2"}:
+        names.add(f"{seq_name.upper()}WI")
+    return names
+
+
+def sequence_candidate_rank(nii_file, seq_id):
+    seq_name = ALL_SEQUENCES[seq_id - 1]
+    stem = nii_stem(nii_file).upper()
+    exact_rank = 0 if stem in exact_sequence_names(seq_name) else 1
+    return exact_rank, len(stem), str(nii_file).upper()
+
+
+def select_sequence_files(case_dir):
+    seq_candidates = {seq_id: [] for seq_id in range(1, NUM_SEQUENCES + 1)}
+
+    for nii_file in sorted(case_dir.rglob("*.nii*")):
+        seq_id = identify_sequence(nii_file)
+        if seq_id is None:
+            continue
+        seq_candidates[seq_id].append(nii_file)
+
+    selected = {}
+    for seq_id, candidates in seq_candidates.items():
+        if not candidates:
+            continue
+        selected[seq_id] = sorted(
+            candidates,
+            key=lambda path: sequence_candidate_rank(path, seq_id),
+        )[0]
+
+    missing_seq_ids = [
+        seq_id for seq_id in range(1, NUM_SEQUENCES + 1) if seq_id not in selected
+    ]
+    return selected, seq_candidates, missing_seq_ids
+
+
+def cleanup_outputs(output_paths):
+    for out_path in output_paths:
+        if out_path.exists():
+            out_path.unlink()
+        meta_path = get_preprocess_meta_path(out_path)
+        if meta_path.exists():
+            meta_path.unlink()
+        # 兼容清理由旧流程生成的 foreground 中间产物；新流程不再保存它。
+        foreground_path = get_preprocess_foreground_path(out_path)
+        if foreground_path.exists():
+            foreground_path.unlink()
+
+
+def get_preprocess_meta_path(image_path: Path):
+    name = image_path.name
+    if name.endswith(".nii.gz"):
+        stem = name[:-7]
+    elif name.endswith(".nii"):
+        stem = name[:-4]
+    else:
+        stem = image_path.stem
+    return image_path.with_name(f"{stem}_preprocess.json")
+
+
+def get_preprocess_foreground_path(image_path: Path):
+    name = image_path.name
+    if name.endswith(".nii.gz"):
+        stem = name[:-7]
+    elif name.endswith(".nii"):
+        stem = name[:-4]
+    else:
+        stem = image_path.stem
+    return image_path.with_name(f"preprocess_{stem}_foreground.nii.gz")
+
+
+def get_case_output_paths(out_root, output_class_dir, case_id_str):
+    return [
+        out_root
+        / output_class_dir
+        / str(seq_id)
+        / f"case_{case_id_str}_{seq_id}.nii.gz"
+        for seq_id in range(1, NUM_SEQUENCES + 1)
+    ]
+
+
+def existing_case_outputs_are_valid(output_paths):
+    """
+    已经登记到 case_index 的 case，只有三序列文件都存在且通过 QC 才允许跳过。
+    否则认为是历史部分失败/污染输出，需要重新预处理并追加新 case_id。
+    """
+    for out_path in output_paths:
+        if not out_path.exists():
+            return False, [f"missing_output:{out_path}"]
+        meta_path = get_preprocess_meta_path(out_path)
+        if not meta_path.exists():
+            return False, [f"missing_preprocess_meta:{meta_path}"]
+
+        try:
+            img = sitk.ReadImage(str(out_path))
+        except Exception as e:
+            return False, [f"read_existing_failed:{out_path}:{type(e).__name__}:{e}"]
+
+        ok, reasons = validate_preprocessed_image(
+            img,
+            target_shape=TARGET_SHAPE,
+            target_spacing=TARGET_SPACING,
+            max_zero_ratio=PREPROCESS_MAX_ZERO_RATIO,
+            min_nonzero_bbox_fraction=PREPROCESS_MIN_NONZERO_BBOX_FRACTION,
+        )
+        if not ok:
+            return False, [f"{out_path}:{';'.join(reasons)}"]
+
+        ok, reasons = validate_saved_file_size(
+            out_path,
+            min_file_size_mb=PREPROCESS_MIN_FILE_SIZE_MB,
+        )
+        if not ok:
+            return False, [f"{out_path}:{';'.join(reasons)}"]
+
+    return True, []
+
+
+def image_geometry_to_dict(img):
+    return {
+        "size_xyz": [int(x) for x in img.GetSize()],
+        "spacing_xyz": [float(x) for x in img.GetSpacing()],
+        "origin_xyz": [float(x) for x in img.GetOrigin()],
+        "direction": [float(x) for x in img.GetDirection()],
+    }
+
+
+def make_preprocess_meta(nii_file, resampled_img, crop_meta, foreground_mask=None):
+    foreground_meta = None
+    if foreground_mask is not None:
+        fg_arr = sitk.GetArrayFromImage(foreground_mask) > 0
+        coords = np.argwhere(fg_arr)
+        if coords.size > 0:
+            foreground_meta = {
+                "bbox_min_zyx": [int(x) for x in coords.min(axis=0)],
+                "bbox_max_zyx": [int(x) for x in coords.max(axis=0)],
+                "voxel_count": int(coords.shape[0]),
+            }
+
+    return {
+        "schema_version": 2,
+        "raw_image_path": str(Path(nii_file).resolve()),
+        "target_spacing_xyz": [float(x) for x in TARGET_SPACING],
+        "target_shape_zyx": [int(x) for x in TARGET_SHAPE],
+        "brain_extractor": BRAIN_EXTRACTOR,
+        "foreground_zero_outside": bool(FOREGROUND_ZERO_OUTSIDE),
+        "foreground_dilation_mm": float(FOREGROUND_DILATION_MM),
+        "resampled_reference": image_geometry_to_dict(resampled_img),
+        "crop": crop_meta,
+        "foreground": foreground_meta,
+    }
+
+
+def save_preprocess_meta(meta, meta_path: Path):
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
 
 
 def validate_preprocess_setup():
@@ -83,11 +255,13 @@ def preprocess_image(nii_file):
         is_label=False,
     )
     if resampled_img is None:
-        return None
+        return None, None
 
     if BRAIN_EXTRACTOR == "none":
         normalized_img = normalize_intensity(resampled_img)
-        return center_crop_or_pad(normalized_img, TARGET_SHAPE)
+        fixed_img, crop_meta = center_crop_or_pad_with_meta(normalized_img, TARGET_SHAPE)
+        meta = make_preprocess_meta(nii_file, resampled_img, crop_meta, foreground_mask=None)
+        return fixed_img, meta
 
     foreground_mask = extract_foreground_mask_hd_bet(
         resampled_img,
@@ -110,7 +284,13 @@ def preprocess_image(nii_file):
     if FOREGROUND_ZERO_OUTSIDE:
         normalized_img = zero_outside_mask(normalized_img, foreground_mask)
 
-    return crop_or_pad_around_mask(normalized_img, foreground_mask, TARGET_SHAPE)
+    fixed_img, crop_meta = crop_or_pad_around_mask_with_meta(
+        normalized_img,
+        foreground_mask,
+        TARGET_SHAPE,
+    )
+    meta = make_preprocess_meta(nii_file, resampled_img, crop_meta, foreground_mask)
+    return fixed_img, meta
 
 
 def main(args):
@@ -187,29 +367,79 @@ def main(args):
                 case_key = folder_name
 
             # --- 增量检查 ---
+            # 只有已登记 case 的三序列输出都存在且通过 QC，才跳过。
+            # 如果历史输出不完整或污染，清理旧输出并重新预处理；成功后追加新 ID。
             if case_key in case_index:
-                continue
-
-            # --- 分配新 ID ---
-            max_case_id += 1
-            # 格式化为 0001 (str)
-            case_id_str = f"{max_case_id:04d}"
-            # 记录索引
-            case_index[case_key] = max_case_id
-
-            # --- 扫描并处理 NIfTI 文件 ---
-            # 使用 rglob 递归查找，与旧代码一致
-            for nii_file in case_dir.rglob("*.nii*"):
-                # [关键修正] 传入 Path 对象
-                seq_id = identify_sequence(nii_file)
-                
-                if seq_id is None:
+                existing_case_id_str = f"{int(case_index[case_key]):04d}"
+                existing_output_paths = get_case_output_paths(
+                    out_root,
+                    output_class_dir,
+                    existing_case_id_str,
+                )
+                valid_existing, reasons = existing_case_outputs_are_valid(existing_output_paths)
+                if valid_existing:
                     continue
 
+                tqdm.write(
+                    f"[Warning] Existing indexed case is incomplete/invalid, retry with new ID: "
+                    f"{case_dir.resolve()} | old ID: {existing_case_id_str} | "
+                    f"reasons: {';'.join(reasons)}"
+                )
+                append_error_log(
+                    error_log_path,
+                    {
+                        "case_id": existing_case_id_str,
+                        "case_key": case_key,
+                        "seq_id": "",
+                        "nii_file": str(case_dir.resolve()),
+                        "stage": "existing_output_invalid",
+                        "error": ";".join(reasons),
+                    },
+                )
+                cleanup_outputs(existing_output_paths)
+                case_index.pop(case_key, None)
+                save_index(case_index, index_path)
+
+            selected_files, _, missing_seq_ids = select_sequence_files(case_dir)
+            if missing_seq_ids:
+                missing_names = [ALL_SEQUENCES[seq_id - 1] for seq_id in missing_seq_ids]
+                tqdm.write(
+                    f"[Warning] Incomplete sequences, skip case: {case_dir.resolve()} | "
+                    f"missing: {','.join(missing_names)}"
+                )
+                append_error_log(
+                    error_log_path,
+                    {
+                        "case_id": "",
+                        "case_key": case_key,
+                        "seq_id": "",
+                        "nii_file": str(case_dir.resolve()),
+                        "stage": "missing_sequences",
+                        "error": ",".join(missing_names),
+                    },
+                )
+                continue
+
+            # 只有三序列完整且全部处理成功，才会登记 case_index。
+            case_id = max_case_id + 1
+            case_id_str = f"{case_id:04d}"
+            output_paths = get_case_output_paths(out_root, output_class_dir, case_id_str)
+            cleanup_outputs(output_paths)
+
+            processed_images = {}
+            preprocess_metas = {}
+            case_ok = True
+
+            for seq_id in range(1, NUM_SEQUENCES + 1):
+                nii_file = selected_files[seq_id]
+
                 try:
-                    fixed_img = preprocess_image(nii_file)
+                    fixed_img, preprocess_meta = preprocess_image(nii_file)
                     if fixed_img is None:
-                        tqdm.write(f"[Warning] Failed to load/resample file: {nii_file.resolve()} | ID: {case_id_str}")
+                        tqdm.write(
+                            f"[Warning] Failed to load/resample file: {nii_file.resolve()} | "
+                            f"ID: {case_id_str}"
+                        )
                         append_error_log(
                             error_log_path,
                             {
@@ -221,11 +451,8 @@ def main(args):
                                 "error": "resample_image returned None",
                             },
                         )
-                        continue
-
-                    # 保存模型输入图像；foreground mask 只在预处理过程中临时使用
-                    out_name = f"case_{case_id_str}_{seq_id}.nii.gz"
-                    out_path = out_root / output_class_dir / str(seq_id) / out_name
+                        case_ok = False
+                        break
 
                     ok, reasons = validate_preprocessed_image(
                         fixed_img,
@@ -250,18 +477,52 @@ def main(args):
                                 "error": ";".join(reasons),
                             },
                         )
-                        continue
+                        case_ok = False
+                        break
 
-                    if not out_path.exists():
-                        save_image(fixed_img, out_path)
+                    processed_images[seq_id] = fixed_img
+                    preprocess_metas[seq_id] = preprocess_meta
+
+                except Exception as e:
+                    tqdm.write(f"\n[Error] Unknown error processing {nii_file}: {e}")
+                    append_error_log(
+                        error_log_path,
+                        {
+                            "case_id": case_id_str,
+                            "case_key": case_key,
+                            "seq_id": seq_id,
+                            "nii_file": str(nii_file.resolve()),
+                            "stage": "exception",
+                            "error": f"{type(e).__name__}: {e}",
+                        },
+                    )
+                    case_ok = False
+                    break
+
+            if not case_ok:
+                cleanup_outputs(output_paths)
+                continue
+
+            for seq_id in range(1, NUM_SEQUENCES + 1):
+                nii_file = selected_files[seq_id]
+                out_path = (
+                    out_root
+                    / output_class_dir
+                    / str(seq_id)
+                    / f"case_{case_id_str}_{seq_id}.nii.gz"
+                )
+                try:
+                    save_image(processed_images[seq_id], out_path)
+                    save_preprocess_meta(
+                        preprocess_metas[seq_id],
+                        get_preprocess_meta_path(out_path),
+                    )
 
                     ok, reasons = validate_saved_file_size(
                         out_path,
                         min_file_size_mb=PREPROCESS_MIN_FILE_SIZE_MB,
                     )
                     if not ok:
-                        if out_path.exists():
-                            out_path.unlink()
                         tqdm.write(
                             f"[Warning] QC failed after save: {out_path.resolve()} | "
                             f"ID: {case_id_str} | reasons: {';'.join(reasons)}"
@@ -277,6 +538,8 @@ def main(args):
                                 "error": ";".join(reasons),
                             },
                         )
+                        case_ok = False
+                        break
                     elif reasons:
                         append_error_log(
                             error_log_path,
@@ -289,10 +552,8 @@ def main(args):
                                 "error": ";".join(reasons),
                             },
                         )
-                
                 except Exception as e:
-                    # 其他 Python 错误
-                    tqdm.write(f"\n[Error] Unknown error processing {nii_file}: {e}")
+                    tqdm.write(f"\n[Error] Failed to save {out_path}: {e}")
                     append_error_log(
                         error_log_path,
                         {
@@ -300,11 +561,20 @@ def main(args):
                             "case_key": case_key,
                             "seq_id": seq_id,
                             "nii_file": str(nii_file.resolve()),
-                            "stage": "exception",
+                            "stage": "save_exception",
                             "error": f"{type(e).__name__}: {e}",
                         },
                     )
-                    continue
+                    case_ok = False
+                    break
+
+            if not case_ok:
+                cleanup_outputs(output_paths)
+                continue
+
+            max_case_id = case_id
+            case_index[case_key] = case_id
+            save_index(case_index, index_path)
 
     # ===== 保存索引 =====
     save_index(case_index, index_path)

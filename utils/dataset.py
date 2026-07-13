@@ -18,6 +18,8 @@ def load_nii_as_tensor(nii_path: Path) -> torch.Tensor:
     """
     nii = nib.load(str(nii_path))
     data = nii.get_fdata(dtype=np.float32)
+    # nibabel 返回 NIfTI 轴顺序 (X, Y, Z)；模型和预处理配置使用 (D, H, W) = (Z, Y, X)
+    data = np.transpose(data, (2, 1, 0))
     data = np.ascontiguousarray(data)
     return torch.from_numpy(data.copy()).unsqueeze(0)
 

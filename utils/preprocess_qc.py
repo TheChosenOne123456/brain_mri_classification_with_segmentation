@@ -68,6 +68,6 @@ def validate_saved_file_size(path: Path, min_file_size_mb):
 
     file_size_mb = path.stat().st_size / (1024 * 1024)
     if file_size_mb < min_file_size_mb:
-        return True, [f"small_file_warning:{file_size_mb:.6f}MB"]
+        return False, [f"small_file:{file_size_mb:.6f}MB"]
 
     return True, []

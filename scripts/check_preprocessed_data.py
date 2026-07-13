@@ -3,7 +3,7 @@
 
 默认扫描 configs.global_config.PROCESSED_DATA_PATH，只读取文件，不修改数据。
 默认快速检查内容包括：
-- shape 是否等于 TARGET_SHAPE
+- NIfTI shape 是否等于 TARGET_SHAPE 对应的 (X, Y, Z) 顺序
 - spacing 是否等于 TARGET_SPACING
 - 文件大小是否异常
 - 同一 case 是否缺少序列
@@ -37,6 +37,15 @@ from configs.global_config import (
     TARGET_SHAPE,
     TARGET_SPACING,
 )
+
+
+def target_shape_to_nifti_shape(target_shape):
+    """
+    项目 TARGET_SHAPE 使用 SimpleITK array / torch 体数据顺序 (D, H, W)。
+    nibabel 读取 NIfTI 时返回 (X, Y, Z)，对应 (W, H, D)。
+    """
+    d, h, w = target_shape
+    return (w, h, d)
 
 
 def parse_case_file(path: Path):
@@ -368,6 +377,17 @@ def main():
     parser.add_argument("--include_masks", action="store_true")
     parser.add_argument("--spacing_atol", type=float, default=1e-3)
     parser.add_argument(
+        "--expected_shape",
+        type=int,
+        nargs=3,
+        default=None,
+        metavar=("X", "Y", "Z"),
+        help=(
+            "Expected NIfTI shape in nibabel order (X Y Z). "
+            "Default is derived from TARGET_SHAPE(D,H,W) as (W,H,D)."
+        ),
+    )
+    parser.add_argument(
         "--full_stats",
         action="store_true",
         help="Read voxel data to compute NaN/Inf, zero ratio, intensity stats and nonzero bbox. Slower.",
@@ -376,8 +396,16 @@ def main():
     args = parser.parse_args()
 
     data_root = Path(args.data_root)
-    expected_shape = tuple(TARGET_SHAPE)
+    expected_shape = (
+        tuple(args.expected_shape)
+        if args.expected_shape is not None
+        else target_shape_to_nifti_shape(tuple(TARGET_SHAPE))
+    )
     expected_spacing = tuple(TARGET_SPACING)
+
+    print(f"[CONFIG] TARGET_SHAPE(D,H,W): {tuple(TARGET_SHAPE)}")
+    print(f"[CONFIG] Expected NIfTI shape(X,Y,Z): {expected_shape}")
+    print(f"[CONFIG] Expected spacing(X,Y,Z): {expected_spacing}")
 
     if not data_root.exists():
         raise FileNotFoundError(f"Data root does not exist: {data_root}")
