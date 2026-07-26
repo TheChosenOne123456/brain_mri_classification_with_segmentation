@@ -34,6 +34,36 @@ from utils.train_and_test import set_seed, load_pt_dataset
 import warnings
 warnings.filterwarnings("ignore", message="You are using `torch.load` with `weights_only=False`")
 
+
+def get_classification_loss_metadata(criterion, class_counts):
+    """生成与实际分类损失一致的 checkpoint 元数据。"""
+    metadata = {
+        "class_counts": class_counts.detach().cpu().tolist(),
+    }
+
+    if isinstance(criterion, nn.CrossEntropyLoss):
+        weights = criterion.weight
+        metadata.update({
+            "classification_loss": "weighted_cross_entropy"
+            if weights is not None else "cross_entropy",
+            "class_weights": weights.detach().cpu().tolist()
+            if weights is not None else None,
+        })
+        return metadata
+
+    if isinstance(criterion, ClassBalancedFocalLoss):
+        metadata.update({
+            "classification_loss": "class_balanced_focal",
+            "class_weights": criterion.class_weights.detach().cpu().tolist(),
+            "class_balance_beta": CLASS_BALANCE_BETA,
+            "focal_gamma": criterion.gamma,
+        })
+        return metadata
+
+    metadata["classification_loss"] = criterion.__class__.__name__
+    return metadata
+
+
 def compute_dice(pred_mask, gt_mask, num_classes=3, smooth=1e-5):
     dices = []
     # 忽略类别 0 (背景/正常)，仅计算异常类别（如 1:炎症, 2:转移瘤）的 Dice
@@ -221,18 +251,30 @@ def main(args):
         model = nn.DataParallel(model)
 
     all_labels = train_set.labels.tolist() if isinstance(train_set.labels, torch.Tensor) else list(train_set.labels)
-    class_counts = torch.bincount(torch.as_tensor(all_labels), minlength=NUM_CLASSES)
+    # class_counts = torch.bincount(torch.as_tensor(all_labels), minlength=NUM_CLASSES)
 
-    # 每个 fold 只使用自身训练集计数，避免验证集或测试集信息泄漏。
-    criterion = ClassBalancedFocalLoss(
-        samples_per_class=class_counts,
-        beta=CLASS_BALANCE_BETA,
-        gamma=FOCAL_GAMMA,
-    ).to(DEVICE)
-    print(f"Class Counts: {class_counts.tolist()}")
-    print(f"Class-Balanced Weights: {criterion.class_weights.detach().cpu().tolist()}")
-    print(f"Focal Loss: beta={CLASS_BALANCE_BETA}, gamma={FOCAL_GAMMA}")
-    
+    # # 每个 fold 只使用自身训练集计数，避免验证集或测试集信息泄漏。
+    # criterion = ClassBalancedFocalLoss(
+    #     samples_per_class=class_counts,
+    #     beta=CLASS_BALANCE_BETA,
+    #     gamma=FOCAL_GAMMA,
+    # ).to(DEVICE)
+    # print(f"Class Counts: {class_counts.tolist()}")
+    # print(f"Class-Balanced Weights: {criterion.class_weights.detach().cpu().tolist()}")
+    # print(f"Focal Loss: beta={CLASS_BALANCE_BETA}, gamma={FOCAL_GAMMA}")
+    class_counts = torch.bincount(torch.tensor(all_labels), minlength=NUM_CLASSES)
+
+    # 权重计算
+    total_samples = len(all_labels)
+    raw_weights = total_samples / (NUM_CLASSES * class_counts.float() + 1e-6)
+    class_weights = torch.pow(raw_weights, 0.5)
+
+    # 将权重转到 device
+    class_weights = class_weights.to(DEVICE)
+    print(f"Class Weights: {class_weights.tolist()}")
+
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+
     # 在设备上创建一个极其侧重类别 1 和 2 的权重
     # 假设背景权重很小(0.1)，炎症权重10.0，转移瘤权重10.0
     seg_class_weights = torch.tensor(SEG_CLASS_WEIGHTS, dtype=torch.float32).to(DEVICE)
@@ -406,11 +448,7 @@ def main(args):
                 "val_loss": best_val_loss,
                 "val_acc": val_acc,
                 "val_f1": val_f1,
-                "classification_loss": "class_balanced_focal",
-                "class_counts": class_counts.tolist(),
-                "class_weights": criterion.class_weights.detach().cpu().tolist(),
-                "class_balance_beta": CLASS_BALANCE_BETA,
-                "focal_gamma": FOCAL_GAMMA,
+                **get_classification_loss_metadata(criterion, class_counts),
             }, best_model_path)
             # 即使在 MIN_EPOCHS 内，也保存更好的模型
         else:

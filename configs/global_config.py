@@ -6,6 +6,9 @@
 '''
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+EXCLUDED_CASE_IDS_PATH = PROJECT_ROOT / "excluded_case_ids.txt"
+
 EXPERIMENT_VERSION = "version1"   # 原版 
 # EXPERIMENT_VERSION = "version2"     # 采用加强版炎症数据
 
@@ -65,6 +68,14 @@ if EXPERIMENT_VERSION == "version1":
         Path("/home/ailab/data/brainMRI/脑炎mask"),
         Path("/home/ailab/data/brainMRI/脑膜炎mask"),
         Path("/home/ailab/data/brainMRI/脑膜转移mask"),
+        Path("/home/ailab/data/brainMRI/脑炎mask1"),
+        Path("/home/ailab/data/brainMRI/脑炎mask2"),
+        Path("/home/ailab/data/brainMRI/脑炎mask3"),
+        Path("/home/ailab/data/brainMRI/脑炎mask4"),
+        Path("/home/ailab/data/brainMRI/脑炎mask5"),
+        Path("/home/ailab/data/brainMRI/脑炎mask6"),
+        Path("/home/ailab/data/brainMRI/脑炎mask7"),
+        Path("/home/ailab/data/brainMRI/脑炎mask8"),
     ]
 
     # ========== Preprocessing ==========

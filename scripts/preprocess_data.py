@@ -30,6 +30,21 @@ from utils.preprocess_qc import validate_preprocessed_image, validate_saved_file
 ERROR_LOG_FIELDS = ["case_id", "case_key", "seq_id", "nii_file", "stage", "error"]
 
 
+def load_excluded_case_ids(path):
+    """读取每行一个病例编号的排除名单，忽略空行和 # 注释。"""
+    path = Path(path)
+    if not path.exists():
+        return set()
+
+    excluded = set()
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            case_id = line.split("#", 1)[0].strip()
+            if case_id:
+                excluded.add(case_id)
+    return excluded
+
+
 def append_error_log(log_path, row):
     log_path.parent.mkdir(parents=True, exist_ok=True)
     write_header = not log_path.exists()
@@ -130,6 +145,30 @@ def get_case_output_paths(out_root, output_class_dir, case_id_str):
         / f"case_{case_id_str}_{seq_id}.nii.gz"
         for seq_id in range(1, NUM_SEQUENCES + 1)
     ]
+
+
+def find_case_output_class_dirs(out_root, case_id_str):
+    """查找磁盘上已经包含该 case 任一图像或 meta 的类别目录。"""
+    class_dirs = []
+    for class_dir in sorted(p for p in out_root.iterdir() if p.is_dir()):
+        output_paths = get_case_output_paths(out_root, class_dir.name, case_id_str)
+        if any(
+            out_path.exists() or get_preprocess_meta_path(out_path).exists()
+            for out_path in output_paths
+        ):
+            class_dirs.append(class_dir.name)
+    return class_dirs
+
+
+def get_max_case_id_on_disk(out_root):
+    """索引之外也可能存在历史遗留文件，分配新 ID 时一并避开。"""
+    max_case_id = 0
+    pattern = re.compile(r"^case_(\d+)_\d+\.nii(?:\.gz)?$")
+    for path in out_root.glob("*/*/case_*_*.nii*"):
+        match = pattern.match(path.name)
+        if match:
+            max_case_id = max(max_case_id, int(match.group(1)))
+    return max_case_id
 
 
 def existing_case_outputs_are_valid(output_paths):
@@ -303,11 +342,12 @@ def main(args):
     out_root.mkdir(parents=True, exist_ok=True)
     index_path = out_root / INDEX_FILE_NAME
     error_log_path = out_root / "preprocess_errors.csv"
+    excluded_case_ids = load_excluded_case_ids(EXCLUDED_CASE_IDS_PATH)
 
     # ===== 读取 / 初始化 index =====
     case_index = load_index(index_path)
 
-    # 恢复计数器状态
+    # 恢复计数器状态；同时扫描磁盘，避免与未登记的历史遗留文件撞号。
     if case_index:
         try:
             # 兼容旧索引结构：Key是原始路径/文件名，Value是int ID
@@ -316,9 +356,14 @@ def main(args):
             max_case_id = 0
     else:
         max_case_id = 0
+    max_case_id = max(max_case_id, get_max_case_id_on_disk(out_root))
 
     print(f"Starting preprocessing for {NUM_CLASSES} classes: {CLASS_NAMES}")
     print(f"Current Max Case ID: {max_case_id}")
+    print(
+        f"Excluded Case IDs: {len(excluded_case_ids)} "
+        f"({Path(EXCLUDED_CASE_IDS_PATH).resolve()})"
+    )
 
     # ===== [核心修改] 动态遍历所有类别 =====
     # 逻辑：遍历 global_config 中定义的所有类别，而不是写死 normal/meningitis
@@ -366,23 +411,66 @@ def main(args):
             else:
                 case_key = folder_name
 
+            if case_key in excluded_case_ids:
+                continue
+
             # --- 增量检查 ---
-            # 只有已登记 case 的三序列输出都存在且通过 QC，才跳过。
-            # 如果历史输出不完整或污染，清理旧输出并重新预处理；成功后追加新 ID。
+            # case_index 是跨类别的全局索引，因此先在所有类别目录中查找旧 ID。
+            # 同一个病例号可能重复出现在不同诊断源目录，已有任一完整输出即跳过。
+            retry_case_id = None
             if case_key in case_index:
-                existing_case_id_str = f"{int(case_index[case_key]):04d}"
+                existing_case_id = int(case_index[case_key])
+                existing_case_id_str = f"{existing_case_id:04d}"
+                existing_class_dirs = find_case_output_class_dirs(
+                    out_root,
+                    existing_case_id_str,
+                )
+
+                valid_existing = False
+                invalid_reasons_by_class = {}
+                for existing_class_dir in existing_class_dirs:
+                    existing_paths = get_case_output_paths(
+                        out_root,
+                        existing_class_dir,
+                        existing_case_id_str,
+                    )
+                    valid, reasons = existing_case_outputs_are_valid(existing_paths)
+                    if valid:
+                        valid_existing = True
+                        break
+                    invalid_reasons_by_class[existing_class_dir] = reasons
+
+                if valid_existing:
+                    continue
+
+                # 旧 ID 的残留文件属于另一个类别时，留给遍历到原类别时修复。
+                # 这样不会用当前这个跨类别重复目录覆盖原标签。
+                if existing_class_dirs and output_class_dir not in existing_class_dirs:
+                    append_error_log(
+                        error_log_path,
+                        {
+                            "case_id": existing_case_id_str,
+                            "case_key": case_key,
+                            "seq_id": "",
+                            "nii_file": str(case_dir.resolve()),
+                            "stage": "duplicate_case_other_class_deferred",
+                            "error": ",".join(existing_class_dirs),
+                        },
+                    )
+                    continue
+
                 existing_output_paths = get_case_output_paths(
                     out_root,
                     output_class_dir,
                     existing_case_id_str,
                 )
-                valid_existing, reasons = existing_case_outputs_are_valid(existing_output_paths)
-                if valid_existing:
-                    continue
-
+                reasons = invalid_reasons_by_class.get(
+                    output_class_dir,
+                    [f"missing_output:{existing_output_paths[0]}"],
+                )
                 tqdm.write(
-                    f"[Warning] Existing indexed case is incomplete/invalid, retry with new ID: "
-                    f"{case_dir.resolve()} | old ID: {existing_case_id_str} | "
+                    f"[Warning] Existing indexed case is incomplete/invalid, retry with same ID: "
+                    f"{case_dir.resolve()} | ID: {existing_case_id_str} | "
                     f"reasons: {';'.join(reasons)}"
                 )
                 append_error_log(
@@ -396,17 +484,17 @@ def main(args):
                         "error": ";".join(reasons),
                     },
                 )
-                cleanup_outputs(existing_output_paths)
-                case_index.pop(case_key, None)
-                save_index(case_index, index_path)
+                retry_case_id = existing_case_id
 
             selected_files, _, missing_seq_ids = select_sequence_files(case_dir)
             if missing_seq_ids:
                 missing_names = [ALL_SEQUENCES[seq_id - 1] for seq_id in missing_seq_ids]
-                tqdm.write(
-                    f"[Warning] Incomplete sequences, skip case: {case_dir.resolve()} | "
-                    f"missing: {','.join(missing_names)}"
-                )
+                # 仅有 4/5 等非目标序列的目录会三序列全缺，数量较多，不在终端刷屏。
+                if len(missing_seq_ids) < NUM_SEQUENCES:
+                    tqdm.write(
+                        f"[Warning] Incomplete sequences, skip case: {case_dir.resolve()} | "
+                        f"missing: {','.join(missing_names)}"
+                    )
                 append_error_log(
                     error_log_path,
                     {
@@ -420,8 +508,8 @@ def main(args):
                 )
                 continue
 
-            # 只有三序列完整且全部处理成功，才会登记 case_index。
-            case_id = max_case_id + 1
+            # 旧 case 修复沿用原 ID；全新 case 才分配递增 ID。
+            case_id = retry_case_id if retry_case_id is not None else max_case_id + 1
             case_id_str = f"{case_id:04d}"
             output_paths = get_case_output_paths(out_root, output_class_dir, case_id_str)
             cleanup_outputs(output_paths)
@@ -572,7 +660,7 @@ def main(args):
                 cleanup_outputs(output_paths)
                 continue
 
-            max_case_id = case_id
+            max_case_id = max(max_case_id, case_id)
             case_index[case_key] = case_id
             save_index(case_index, index_path)
 
