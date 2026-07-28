@@ -17,8 +17,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from configs.train_config import *
-from configs.global_config import *
+from runtime_defaults import *
 from models.FoundationModel import FoundationModel
 from utils.train_and_test import set_seed, load_pt_dataset
 

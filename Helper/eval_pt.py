@@ -5,8 +5,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from pathlib import Path
 
-from configs.train_config import *
-from configs.global_config import *
+from runtime_defaults import *
 
 from models.cnn3d import Simple3DCNN
 from models.ResNet import ResNet10, ResNet18

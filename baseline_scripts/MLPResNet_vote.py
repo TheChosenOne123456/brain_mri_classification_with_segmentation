@@ -34,8 +34,15 @@ warnings.filterwarnings("ignore", message="You are using `torch.load` with `weig
 ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.append(str(ROOT_DIR))
 
-from configs.global_config import ALL_SEQUENCES, NUM_CLASSES, CLASS_NAMES, K_FOLDS, DATASET_ROOT
-from configs.train_config import BATCH_SIZE, NUM_WORKERS
+from runtime_defaults import (
+    ALL_SEQUENCES,
+    BATCH_SIZE,
+    CLASS_NAMES,
+    DATASET_ROOT,
+    K_FOLDS,
+    NUM_CLASSES,
+    NUM_WORKERS,
+)
 from utils.train_and_test import load_pt_dataset
 
 # 导入你在 MLPResNet 中定义好的模型

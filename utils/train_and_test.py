@@ -151,8 +151,61 @@ class PTDataset(Dataset):
         return image_tensor, label, mask_tensor, has_mask_flag, case_id
 
 
-def load_pt_dataset(pt_path):
+def _rebase_data_path(path_value, data_root):
+    """让旧 .pt 中的相对路径或已失效绝对路径可定位到显式 data 根目录。"""
+    if path_value is None:
+        return None
+
+    path = Path(path_value)
+    if path.exists():
+        return path.resolve()
+    if data_root is None:
+        return path
+
+    data_root = Path(data_root).resolve()
+    candidates = []
+
+    # 兼容 version1/data/0_normal/1/case_xxx.nii.gz 一类历史路径。
+    if "data" in path.parts:
+        data_idx = len(path.parts) - 1 - path.parts[::-1].index("data")
+        candidates.append(data_root.joinpath(*path.parts[data_idx + 1 :]))
+
+    # 兼容搬动根目录后保留的绝对路径，利用稳定的末三级目录结构重定位。
+    if len(path.parts) >= 3:
+        candidates.append(data_root.joinpath(*path.parts[-3:]))
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return path
+
+
+def _rebase_cases(cases, data_root):
+    rebased = []
+    for original_case in cases:
+        case = dict(original_case)
+        case["nii_path"] = _rebase_data_path(case["nii_path"], data_root)
+        if case.get("mask_path") is not None:
+            case["mask_path"] = _rebase_data_path(case["mask_path"], data_root)
+        rebased.append(case)
+    return rebased
+
+
+def _infer_data_root_from_pt_path(pt_path):
+    """从 .../datasets/.../*.pt 推断同一数据实验根下的 data 目录。"""
+    pt_path = Path(pt_path).resolve()
+    for parent in pt_path.parents:
+        if parent.name == "datasets":
+            candidate = parent.parent / "data"
+            if candidate.is_dir():
+                return candidate
+    return None
+
+
+def load_pt_dataset(pt_path, data_root=None):
     # 此处读取到的只是个几十K的文本字典
     data = torch.load(pt_path, weights_only=False)
+    if data_root is None:
+        data_root = _infer_data_root_from_pt_path(pt_path)
     # 将字典中的路径和索引喂给代理 Dataset
-    return PTDataset(data["cases"])
+    return PTDataset(_rebase_cases(data["cases"], data_root))

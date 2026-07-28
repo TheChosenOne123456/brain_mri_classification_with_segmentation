@@ -30,8 +30,7 @@ import nibabel as nib
 from sklearn.metrics import accuracy_score, confusion_matrix
 
 # 导入项目中已有的组件
-from configs.train_config import *
-from configs.global_config import *
+from runtime_defaults import *
 from utils.resample import resample_image
 from utils.intensity import normalize_intensity
 from utils.spatial import center_crop_or_pad

@@ -14,8 +14,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from configs.train_config import *
-from configs.global_config import *
+from configs.config_utils import (
+    TRAIN_CONFIG_FIELDS,
+    infer_data_dir,
+    load_python_config,
+    resolve_input_artifact_dir,
+)
+from configs.global_config import (
+    ALL_SEQUENCES,
+    CLASS_NAMES,
+    K_FOLDS,
+    NUM_CLASSES,
+    SEED,
+)
 
 from models.cnn3d import Simple3DCNN
 from models.ResNet import ResNet10
@@ -65,7 +76,15 @@ class MultiSequenceDataset(Dataset):
 # ================================================
 
 
-def evaluate_vote_single_fold(fold_idx):
+def evaluate_vote_single_fold(
+    fold_idx,
+    dataset_dirs,
+    ckpt_dirs,
+    processed_data_root,
+    batch_size,
+    num_workers,
+    device,
+):
     """
     使用三个模型进行软投票的评估函数
     """
@@ -77,16 +96,24 @@ def evaluate_vote_single_fold(fold_idx):
     print("  -> Loading test sets for all 3 sequences... ", end="", flush=True)
     t0 = time.time()
     for idx, s_name in enumerate(ALL_SEQUENCES):
-        d_dir = DATASET_DIRS[idx] / f"fold{fold_idx}"
+        d_dir = dataset_dirs[idx] / f"fold{fold_idx}"
         if not d_dir.exists():
             print(f"\n[Warning] Dataset missing for {s_name} at {d_dir}. Skipping fold {fold_idx}.")
             return None
-        test_sets_list.append(load_pt_dataset(d_dir / "test.pt"))
+        test_sets_list.append(
+            load_pt_dataset(
+                d_dir / "test.pt",
+                data_root=processed_data_root,
+            )
+        )
     print(f"Done in {time.time()-t0:.1f}s")
     
     test_set = MultiSequenceDataset(test_sets_list)
     test_loader = DataLoader(
-        test_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS
+        test_set,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
     )
 
     # ---------- 2. 初始化并加载 3 个模型 ----------
@@ -100,7 +127,7 @@ def evaluate_vote_single_fold(fold_idx):
             target_model_name = "FoundationModel_ori"
             ModelClass = FoundationModel_ori
 
-        ckpt_dir = CKPT_DIRS[seq_idx] / target_model_name
+        ckpt_dir = ckpt_dirs[seq_idx] / target_model_name
         ckpt_path = ckpt_dir / f"fold{fold_idx}_model_best.pth"
         
         if not ckpt_path.exists():
@@ -113,8 +140,8 @@ def evaluate_vote_single_fold(fold_idx):
         except TypeError:
             model = ModelClass(num_classes=NUM_CLASSES)
             
-        model = model.to(DEVICE)
-        checkpoint = torch.load(ckpt_path, map_location=DEVICE)
+        model = model.to(device)
+        checkpoint = torch.load(ckpt_path, map_location=device)
         model.load_state_dict(checkpoint["model_state"])
         
         if torch.cuda.device_count() > 1:
@@ -133,12 +160,12 @@ def evaluate_vote_single_fold(fold_idx):
     # 注意：投票模式下不计算 Loss，因为直接比较概率
     with torch.no_grad():
         for xs, y, case_ids in test_loader:
-            y = y.to(DEVICE)
+            y = y.to(device)
             
             # xs 包含 3 个 batch tensor (T1, T2, FLAIR)
             probs = []
             for i, x in enumerate(xs):
-                x = x.to(DEVICE)
+                x = x.to(device)
                 
                 logits = models[i](x)
                 
@@ -222,9 +249,25 @@ def evaluate_vote_single_fold(fold_idx):
 
 # ================== 主流程 ==================
 def main(args):
+    config = load_python_config(args.config, TRAIN_CONFIG_FIELDS)
+    dataset_root = resolve_input_artifact_dir(args.data_root, "datasets")
+    ckpt_root = resolve_input_artifact_dir(args.checkpoint_root, "checkpoints")
+    processed_data_root = infer_data_dir(args.data_root)
+    dataset_dirs = [
+        dataset_root / f"seq{seq_id}_{seq_name}"
+        for seq_id, seq_name in enumerate(ALL_SEQUENCES, start=1)
+    ]
+    ckpt_dirs = [
+        ckpt_root / f"seq{seq_id}_{seq_name}"
+        for seq_id, seq_name in enumerate(ALL_SEQUENCES, start=1)
+    ]
+
     set_seed(SEED)
 
     print(f"\n>>> Starting K-Fold Evaluation for: Late Fusion Soft Voting (Heterogeneous) <<<")
+    print(f"Evaluation config: {config.__config_path__}")
+    print(f"Dataset input   : {dataset_root}")
+    print(f"Checkpoint input: {ckpt_root}")
 
     if args.fold is not None:
         folds_to_run = [args.fold]
@@ -236,7 +279,15 @@ def main(args):
     metrics_history = []
 
     for k in folds_to_run:
-        res = evaluate_vote_single_fold(k)
+        res = evaluate_vote_single_fold(
+            k,
+            dataset_dirs=dataset_dirs,
+            ckpt_dirs=ckpt_dirs,
+            processed_data_root=processed_data_root,
+            batch_size=config.BATCH_SIZE,
+            num_workers=config.NUM_WORKERS,
+            device=config.DEVICE,
+        )
         if res:
             metrics_history.append(res)
     
@@ -275,7 +326,21 @@ def main(args):
 # ================== CLI ==================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    # 移除了 --model 参数配置
+    parser.add_argument(
+        "--config",
+        required=True,
+        help="Path to the train_config.py used for runtime evaluation settings",
+    )
+    parser.add_argument(
+        "--data-root",
+        required=True,
+        help="Experiment root containing datasets, or the datasets directory itself",
+    )
+    parser.add_argument(
+        "--checkpoint-root",
+        required=True,
+        help="Training output root containing checkpoints, or checkpoints itself",
+    )
     parser.add_argument(
         "--fold",
         type=int,

@@ -15,7 +15,20 @@ import SimpleITK as sitk
 # [新增] 关闭 SimpleITK 的底层警告输出，防止刷屏
 sitk.ProcessObject_SetGlobalWarningDisplay(False)
 
-from configs.global_config import *
+from configs.config_utils import (
+    PREPROCESS_CONFIG_FIELDS,
+    load_python_config,
+    resolve_output_artifact_dir,
+)
+from configs.global_config import (
+    ALL_SEQUENCES,
+    CLASS_DATA_MAP,
+    CLASS_NAMES,
+    EXCLUDED_CASE_IDS_PATH,
+    NUM_CLASSES,
+    NUM_SEQUENCES,
+    RAW_DATA_PATH,
+)
 
 from utils.sequences import identify_sequence
 from utils.data_scan import collect_cases
@@ -28,6 +41,13 @@ from utils.preprocess_qc import validate_preprocessed_image, validate_saved_file
 
 
 ERROR_LOG_FIELDS = ["case_id", "case_key", "seq_id", "nii_file", "stage", "error"]
+
+
+def apply_preprocessing_config(config):
+    """让原有预处理函数继续使用同名常量，不改变图像处理核心逻辑。"""
+    for name in PREPROCESS_CONFIG_FIELDS:
+        globals()[name] = getattr(config, name)
+    globals()["PREPROCESS_CONFIG_PATH"] = str(config.__config_path__)
 
 
 def load_excluded_case_ids(path):
@@ -231,6 +251,7 @@ def make_preprocess_meta(nii_file, resampled_img, crop_meta, foreground_mask=Non
 
     return {
         "schema_version": 2,
+        "preprocessing_config": PREPROCESS_CONFIG_PATH,
         "raw_image_path": str(Path(nii_file).resolve()),
         "target_spacing_xyz": [float(x) for x in TARGET_SPACING],
         "target_shape_zyx": [int(x) for x in TARGET_SHAPE],
@@ -333,11 +354,13 @@ def preprocess_image(nii_file):
 
 
 def main(args):
+    config = load_python_config(args.config, PREPROCESS_CONFIG_FIELDS)
+    apply_preprocessing_config(config)
     validate_preprocess_setup()
 
     # 路径解析
     raw_root = Path(args.raw_root).resolve()
-    out_root = Path(args.out_root).resolve()
+    out_root = resolve_output_artifact_dir(args.output_root, "data")
 
     out_root.mkdir(parents=True, exist_ok=True)
     index_path = out_root / INDEX_FILE_NAME
@@ -359,6 +382,8 @@ def main(args):
     max_case_id = max(max_case_id, get_max_case_id_on_disk(out_root))
 
     print(f"Starting preprocessing for {NUM_CLASSES} classes: {CLASS_NAMES}")
+    print(f"Preprocessing config: {config.__config_path__}")
+    print(f"Data output root: {out_root}")
     print(f"Current Max Case ID: {max_case_id}")
     print(
         f"Excluded Case IDs: {len(excluded_case_ids)} "
@@ -674,16 +699,20 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Preprocess brain MRI data")
     parser.add_argument(
-        "--raw_root",
+        "--config",
+        required=True,
+        help="Path to a preprocessing_config.py file",
+    )
+    parser.add_argument(
+        "--output-root",
+        required=True,
+        help="Experiment root; processed files are written to OUTPUT_ROOT/data",
+    )
+    parser.add_argument(
+        "--raw-root",
         type=str,
         default=str(RAW_DATA_PATH), # 适配 Path 对象转 str
         help="Path to raw brainMRI directory"
-    )
-    parser.add_argument(
-        "--out_root",
-        type=str,
-        default=str(PROCESSED_DATA_PATH), # 适配 Path 对象转 str
-        help="Output processed data directory"
     )
     args = parser.parse_args()
 

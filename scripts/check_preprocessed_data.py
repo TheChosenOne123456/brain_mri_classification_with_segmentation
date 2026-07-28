@@ -1,22 +1,21 @@
 """
 检查预处理后的 NIfTI 数据质量。
 
-默认扫描 configs.global_config.PROCESSED_DATA_PATH，只读取文件，不修改数据。
+读取显式 --data-root 下的 data，只检查文件，不修改数据。
 默认快速检查内容包括：
 - NIfTI shape 是否等于 TARGET_SHAPE 对应的 (X, Y, Z) 顺序
 - spacing 是否等于 TARGET_SPACING
 - 文件大小是否异常
 - 同一 case 是否缺少序列
 
-使用 --full_stats 时额外检查：
+使用 --full-stats 时额外检查：
 - NaN/Inf
 - 全零或近乎全零
 - 非零区域 bbox 是否异常小、是否贴边
 
 用法：
-    python -m scripts.check_preprocessed_data
-    python -m scripts.check_preprocessed_data --csv_path version1/preprocessed_qc.csv
-    python -m scripts.check_preprocessed_data --full_stats
+    python -m scripts.check_preprocessed_data \
+        --config dataxxx/preprocessing_config.py --data-root dataxxx
 """
 
 import argparse
@@ -27,15 +26,14 @@ from pathlib import Path
 import nibabel as nib
 import numpy as np
 
+from configs.config_utils import (
+    PREPROCESS_CONFIG_FIELDS,
+    load_python_config,
+    resolve_input_artifact_dir,
+)
 from configs.global_config import (
     ALL_SEQUENCES,
     CLASS_NAMES,
-    PROCESSED_DATA_PATH,
-    PREPROCESS_MAX_ZERO_RATIO,
-    PREPROCESS_MIN_FILE_SIZE_MB,
-    PREPROCESS_MIN_NONZERO_BBOX_FRACTION,
-    TARGET_SHAPE,
-    TARGET_SPACING,
 )
 
 
@@ -372,12 +370,21 @@ def write_incomplete_csv(incomplete, case_to_label, csv_path: Path):
 
 def main():
     parser = argparse.ArgumentParser(description="Check preprocessed NIfTI data quality.")
-    parser.add_argument("--data_root", type=str, default=str(PROCESSED_DATA_PATH))
-    parser.add_argument("--csv_path", type=str, default="")
-    parser.add_argument("--include_masks", action="store_true")
-    parser.add_argument("--spacing_atol", type=float, default=1e-3)
     parser.add_argument(
-        "--expected_shape",
+        "--config",
+        required=True,
+        help="Path to the preprocessing_config.py used to produce the data",
+    )
+    parser.add_argument(
+        "--data-root",
+        required=True,
+        help="Experiment root containing data, or the data directory itself",
+    )
+    parser.add_argument("--csv-path", type=str, default="")
+    parser.add_argument("--include-masks", action="store_true")
+    parser.add_argument("--spacing-atol", type=float, default=1e-3)
+    parser.add_argument(
+        "--expected-shape",
         type=int,
         nargs=3,
         default=None,
@@ -388,14 +395,18 @@ def main():
         ),
     )
     parser.add_argument(
-        "--full_stats",
+        "--full-stats",
         action="store_true",
         help="Read voxel data to compute NaN/Inf, zero ratio, intensity stats and nonzero bbox. Slower.",
     )
     parser.add_argument("--strict", action="store_true", help="Exit with code 1 if anomalies exist.")
     args = parser.parse_args()
 
-    data_root = Path(args.data_root)
+    config = load_python_config(args.config, PREPROCESS_CONFIG_FIELDS)
+    for name in PREPROCESS_CONFIG_FIELDS:
+        globals()[name] = getattr(config, name)
+
+    data_root = resolve_input_artifact_dir(args.data_root, "data")
     expected_shape = (
         tuple(args.expected_shape)
         if args.expected_shape is not None
@@ -406,9 +417,8 @@ def main():
     print(f"[CONFIG] TARGET_SHAPE(D,H,W): {tuple(TARGET_SHAPE)}")
     print(f"[CONFIG] Expected NIfTI shape(X,Y,Z): {expected_shape}")
     print(f"[CONFIG] Expected spacing(X,Y,Z): {expected_spacing}")
-
-    if not data_root.exists():
-        raise FileNotFoundError(f"Data root does not exist: {data_root}")
+    print(f"[CONFIG] preprocessing config: {config.__config_path__}")
+    print(f"[CONFIG] data root: {data_root}")
 
     files = collect_files(data_root, include_masks=args.include_masks)
     rows = [

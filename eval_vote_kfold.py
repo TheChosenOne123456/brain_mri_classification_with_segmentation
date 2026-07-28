@@ -14,8 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from configs.train_config import *
-from configs.global_config import *
+from runtime_defaults import *
 
 from models.cnn3d import Simple3DCNN
 from models.ResNet import ResNet10

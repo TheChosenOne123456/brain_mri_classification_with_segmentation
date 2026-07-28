@@ -24,8 +24,18 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.append(str(ROOT_DIR))
 
 from utils.train_and_test import load_pt_dataset
-from configs.global_config import DATASET_ROOT, K_FOLDS, ALL_SEQUENCES, CLASS_NAMES
-from configs.train_config import NUM_EPOCHS, MIN_EPOCHS, BATCH_SIZE, LEARNING_RATE, WEIGHT_DECAY, PATIENCE
+from runtime_defaults import (
+    ALL_SEQUENCES,
+    BATCH_SIZE,
+    CLASS_NAMES,
+    DATASET_ROOT,
+    K_FOLDS,
+    LEARNING_RATE,
+    MIN_EPOCHS,
+    NUM_EPOCHS,
+    PATIENCE,
+    WEIGHT_DECAY,
+)
 
 # === 1. 定义官方风格的 3D ResNet + MLP 分类头 ===
 

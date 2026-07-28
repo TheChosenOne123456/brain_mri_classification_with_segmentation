@@ -1,188 +1,53 @@
-'''
-项目的全局设置，用户可以根据需要进行修改
-[重构] 
-- 支持动态扩展类别
-- 集中管理 "类别名称" 与 "数据源文件夹" 的映射
-'''
+"""项目级全局设置。
+
+这里只放跨预处理、数据集构建、训练都必须保持一致的定义。各阶段容易变化的
+参数随实验保存在 output/data-* 或 output/runs-* 下的独立配置文件中。
+"""
+
 from pathlib import Path
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXCLUDED_CASE_IDS_PATH = PROJECT_ROOT / "excluded_case_ids.txt"
 
-EXPERIMENT_VERSION = "version1"   # 原版 
-# EXPERIMENT_VERSION = "version2"     # 采用加强版炎症数据
+# 可复现性与交叉验证设置
+SEED = 42
+K_FOLDS = 5
 
-# version1
-if EXPERIMENT_VERSION == "version1":
-    SEED = 42
+# Key 的顺序决定 label id，修改后必须同步检查已有数据集和 checkpoint。
+CLASS_DATA_MAP = {
+    "normal": [
+        "正常头颅MRI",
+    ],
+    "inflammation": [
+        "脑膜病变图像/脑膜炎主诊",
+        "脑膜病变图像/脑膜炎次诊",
+        "脑膜病变图像/脑炎",
+        "脑膜病变图像/脑炎次诊",
+    ],
+    "metastasis": [
+        "脑膜病变图像/脑膜转移",
+    ],
+}
+CLASS_NAMES = list(CLASS_DATA_MAP)
+NUM_CLASSES = len(CLASS_NAMES)
 
-    # ========== Task & Data Source ==========
-    # [核心修改] 
-    # 定义类别及其对应的原始数据子目录列表
-    # 格式: "ClassName": ["SubDir1", "SubDir2", ...]
-    # 注意：Key 的顺序决定了 label id (0, 1, 2...)
-    # 如果需要添加新类别，只需在这里添加新的 key-value 对即可，预处理脚本会自动识别并处理
-    CLASS_DATA_MAP = {
-        "normal": [
-            "正常头颅MRI",
-        ],
-        # "meningitis": [
-        #     "脑膜病变图像/脑膜炎主诊",
-        #     "脑膜病变图像/脑膜炎次诊",
-        # ],
-        # "encephalitis": [
-        #     "脑膜病变图像/脑炎",
-        #     "脑膜病变图像/脑炎次诊",
-        # ],
-        # 脑膜炎和脑炎暂时合并为炎症类，后续可以根据需要拆分
-        "inflammation": [
-            "脑膜病变图像/脑膜炎主诊",
-            "脑膜病变图像/脑膜炎次诊",
-            "脑膜病变图像/脑炎",
-            "脑膜病变图像/脑炎次诊",
-        ],
-        "metastasis": [
-            "脑膜病变图像/脑膜转移",
-        ],
-    }
+# 固定序列顺序：seq1=T1、seq2=T2、seq3=FLAIR。
+ALL_SEQUENCES = ["T1", "T2", "FLAIR"]
+NUM_SEQUENCES = len(ALL_SEQUENCES)
 
-    # 自动生成类别列表和数量
-    CLASS_NAMES = list(CLASS_DATA_MAP.keys())
-    NUM_CLASSES = len(CLASS_NAMES)
-
-    # 为了兼容旧代码，保留单独的列表（可选，但建议在预处理脚本中改用 CLASS_DATA_MAP）
-    # MENINGITIS_SUBDIRS = CLASS_DATA_MAP["Meningitis"] 
-    # NORMAL_SUBDIRS = CLASS_DATA_MAP["Normal"]
-
-    # ========== Sequences ==========
-    ALL_SEQUENCES = ["T1", "T2", "FLAIR"]
-    NUM_SEQUENCES = len(ALL_SEQUENCES)
-
-    # ========== Paths ==========
-    RAW_DATA_PATH = Path("/home/ailab/data/brainMRI/脑膜病变")    # 原始数据根目录
-    # PROCESSED_DATA_PATH = "data/processed"
-    PROCESSED_DATA_PATH = Path(f"{EXPERIMENT_VERSION}/data")
-
-    # ========== Masks ==========
-    MASK_ROOTS = [
-        Path("/home/ailab/data/brainMRI/脑炎mask"),
-        Path("/home/ailab/data/brainMRI/脑膜炎mask"),
-        Path("/home/ailab/data/brainMRI/脑膜转移mask"),
-        Path("/home/ailab/data/brainMRI/脑炎mask1"),
-        Path("/home/ailab/data/brainMRI/脑炎mask2"),
-        Path("/home/ailab/data/brainMRI/脑炎mask3"),
-        Path("/home/ailab/data/brainMRI/脑炎mask4"),
-        Path("/home/ailab/data/brainMRI/脑炎mask5"),
-        Path("/home/ailab/data/brainMRI/脑炎mask6"),
-        Path("/home/ailab/data/brainMRI/脑炎mask7"),
-        Path("/home/ailab/data/brainMRI/脑炎mask8"),
-    ]
-
-    # ========== Preprocessing ==========
-    # TARGET_SPACING = (1.0, 1.0, 1.0)  # (D, H, W)
-    # TARGET_SHAPE = (160, 192, 160)
-    TARGET_SPACING = (0.75, 0.75, 3.0)
-    TARGET_SHAPE = (48, 320, 320)
-    BRAIN_EXTRACTOR = "hd-bet"
-    HD_BET_DEVICE = "auto"
-    HD_BET_MODE = "fast"
-    HD_BET_TTA = False
-    HD_BET_VERBOSE = False
-    HD_BET_TARGET_ORIENTATION = "RAS"
-    FOREGROUND_DILATION_MM = 5.0
-    FOREGROUND_ZERO_OUTSIDE = True
-    INTENSITY_CLIP_PERCENTILES = None
-    INTENSITY_ROBUST_ZSCORE = False
-    PREPROCESS_MIN_FILE_SIZE_MB = 1.0
-    PREPROCESS_MAX_ZERO_RATIO = 0.995
-    PREPROCESS_MIN_NONZERO_BBOX_FRACTION = 0.25
-
-    # ========== Dataset ==========
-    DATASET_ROOT = Path(f"{EXPERIMENT_VERSION}/datasets")
-    TRAIN_RATIO = 0.8
-    VAL_RATIO = 0.1
-
-    K_FOLDS = 5 # 用于交叉验证的折数
-    K_FOLDS_VAL_RATIO = 0.15  # val在 train+val 中的比例
-
-    # ========== Inference ==========
-    INFERENCE_OUTPUT_DIR = Path(f"{EXPERIMENT_VERSION}/inference_outputs")
-
-    # ========== 分割结果保存路径 ==========
-    SEG_OUTPUT_DIR = Path(f"{EXPERIMENT_VERSION}/seg_outputs")
-
-
-
-
-# version2
-elif EXPERIMENT_VERSION == "version2":
-    SEED = 42
-
-    # ========== Task & Data Source ==========
-    # [核心修改] 
-    # 定义类别及其对应的原始数据子目录列表
-    # 格式: "ClassName": ["SubDir1", "SubDir2", ...]
-    # 注意：Key 的顺序决定了 label id (0, 1, 2...)
-    # 如果需要添加新类别，只需在这里添加新的 key-value 对即可，预处理脚本会自动识别并处理
-    CLASS_DATA_MAP = {
-        "normal": [
-            "正常头颅MRI",
-        ],
-        "inflammation": [
-            "脑膜病变图像/不明显炎症",
-        ],
-        "metastasis": [
-            "脑膜病变图像/脑膜转移",
-        ],
-    }
-
-    # 自动生成类别列表和数量
-    CLASS_NAMES = list(CLASS_DATA_MAP.keys())
-    NUM_CLASSES = len(CLASS_NAMES)
-
-    # 为了兼容旧代码，保留单独的列表（可选，但建议在预处理脚本中改用 CLASS_DATA_MAP）
-    # MENINGITIS_SUBDIRS = CLASS_DATA_MAP["Meningitis"] 
-    # NORMAL_SUBDIRS = CLASS_DATA_MAP["Normal"]
-
-    # ========== Sequences ==========
-    ALL_SEQUENCES = ["T1", "T2", "FLAIR"]
-    NUM_SEQUENCES = len(ALL_SEQUENCES)
-
-    # ========== Paths ==========
-    RAW_DATA_PATH = Path("/home/ailab/data/brainMRI/脑膜病变")    # 原始数据根目录
-    # PROCESSED_DATA_PATH = "data/processed"
-    PROCESSED_DATA_PATH = Path(f"{EXPERIMENT_VERSION}/data")
-
-    # ========== Preprocessing ==========
-    TARGET_SPACING = (1.0, 1.0, 1.0)  # (D, H, W)
-    TARGET_SHAPE = (160, 192, 160)
-    BRAIN_EXTRACTOR = "hd-bet"
-    HD_BET_DEVICE = "auto"
-    HD_BET_MODE = "fast"
-    HD_BET_TTA = False
-    HD_BET_VERBOSE = False
-    HD_BET_TARGET_ORIENTATION = "RAS"
-    FOREGROUND_DILATION_MM = 5.0
-    FOREGROUND_ZERO_OUTSIDE = True
-    INTENSITY_CLIP_PERCENTILES = None
-    INTENSITY_ROBUST_ZSCORE = False
-    PREPROCESS_MIN_FILE_SIZE_MB = 1.0
-    PREPROCESS_MAX_ZERO_RATIO = 0.995
-    PREPROCESS_MIN_NONZERO_BBOX_FRACTION = 0.25
-
-    # ========== Dataset ==========
-    DATASET_ROOT = Path(f"{EXPERIMENT_VERSION}/datasets")
-    TRAIN_RATIO = 0.8
-    VAL_RATIO = 0.1
-
-    K_FOLDS = 5 # 用于交叉验证的折数
-    K_FOLDS_VAL_RATIO = 0.15  # val在 train+val 中的比例
-
-    # ========== Inference ==========
-    INFERENCE_OUTPUT_DIR = Path(f"{EXPERIMENT_VERSION}/inference_outputs")
-
-    # ========== 分割结果保存路径 ==========
-    SEG_OUTPUT_DIR = Path(f"{EXPERIMENT_VERSION}/seg_outputs")
-
-else:
-    raise ValueError(f"未知的实验版本 (Unknown EXPERIMENT_VERSION): {EXPERIMENT_VERSION}")
+# 原始数据路径属于项目级数据源定义，不随单次实验输出目录变化。
+RAW_DATA_PATH = Path("/home/ailab/data/brainMRI/脑膜病变")
+MASK_ROOTS = [
+    Path("/home/ailab/data/brainMRI/脑炎mask"),
+    Path("/home/ailab/data/brainMRI/脑膜炎mask"),
+    Path("/home/ailab/data/brainMRI/脑膜转移mask"),
+    Path("/home/ailab/data/brainMRI/脑炎mask1"),
+    Path("/home/ailab/data/brainMRI/脑炎mask2"),
+    Path("/home/ailab/data/brainMRI/脑炎mask3"),
+    Path("/home/ailab/data/brainMRI/脑炎mask4"),
+    Path("/home/ailab/data/brainMRI/脑炎mask5"),
+    Path("/home/ailab/data/brainMRI/脑炎mask6"),
+    Path("/home/ailab/data/brainMRI/脑炎mask7"),
+    Path("/home/ailab/data/brainMRI/脑炎mask8"),
+]

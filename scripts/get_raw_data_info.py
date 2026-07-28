@@ -407,35 +407,35 @@ if __name__ == "__main__":
         description="Summarize raw NIfTI size/spacing from configs.global_config."
     )
     parser.add_argument(
-        "--raw_root",
+        "--raw-root",
         type=str,
         default=str(RAW_DATA_PATH),
         help="Raw data root. Defaults to configs.global_config.RAW_DATA_PATH.",
     )
     parser.add_argument(
-        "--mode_precision",
+        "--mode-precision",
         type=int,
         default=3,
         help="Decimal places used before counting approximate modes for spacing/physical size.",
     )
     parser.add_argument(
-        "--min_group_count",
+        "--min-group-count",
         type=int,
         default=1,
         help="Only print grouped summaries with at least this many readable images.",
     )
     parser.add_argument(
-        "--show_errors",
+        "--show-errors",
         action="store_true",
         help="Print missing configured directories and unreadable files.",
     )
     parser.add_argument(
-        "--show_skipped",
+        "--show-skipped",
         action="store_true",
         help="Print NIfTI files skipped because they are not one of ALL_SEQUENCES.",
     )
     parser.add_argument(
-        "--csv_path",
+        "--csv-path",
         type=str,
         default="",
         help="Optional path to save one metadata row per readable image.",

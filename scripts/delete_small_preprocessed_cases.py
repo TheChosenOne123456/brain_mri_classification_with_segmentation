@@ -11,21 +11,20 @@
 
 用法：
     # 查看小于 1MB 的 case，不删除
-    python -m scripts.delete_small_preprocessed_cases --threshold_mb 1
+    python -m scripts.delete_small_preprocessed_cases \
+        --data-root dataxxx --threshold-mb 1
 
     # 真正删除小于 1MB 的 case，并更新 case_index.json
-    python -m scripts.delete_small_preprocessed_cases --threshold_mb 1 --apply
-
-    # 指定数据目录
     python -m scripts.delete_small_preprocessed_cases \
-        --data_root version1/data \
-        --threshold_mb 1 \
+        --data-root dataxxx \
+        --threshold-mb 1 \
         --apply
 
     # 保存删除候选清单
     python -m scripts.delete_small_preprocessed_cases \
-        --threshold_mb 1 \
-        --csv_path version1/delete_small_cases_report.csv
+        --data-root dataxxx \
+        --threshold-mb 1 \
+        --csv-path dataxxx/delete_small_cases_report.csv
 """
 
 import argparse
@@ -34,7 +33,7 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
-from configs.global_config import PROCESSED_DATA_PATH
+from configs.config_utils import resolve_input_artifact_dir
 from utils.io import INDEX_FILE_NAME
 
 
@@ -158,18 +157,20 @@ def main():
     parser = argparse.ArgumentParser(
         description="Delete preprocessed cases whose image files are smaller than a threshold."
     )
-    parser.add_argument("--data_root", type=str, default=str(PROCESSED_DATA_PATH))
-    parser.add_argument("--threshold_mb", type=float, required=True)
+    parser.add_argument(
+        "--data-root",
+        required=True,
+        help="Experiment root containing data, or the data directory itself",
+    )
+    parser.add_argument("--threshold-mb", type=float, required=True)
     parser.add_argument("--apply", action="store_true", help="Actually delete files and update index.")
-    parser.add_argument("--csv_path", type=str, default="")
+    parser.add_argument("--csv-path", type=str, default="")
     args = parser.parse_args()
 
     if args.threshold_mb <= 0:
-        raise ValueError("--threshold_mb must be positive.")
+        raise ValueError("--threshold-mb must be positive.")
 
-    data_root = Path(args.data_root)
-    if not data_root.exists():
-        raise FileNotFoundError(f"Data root does not exist: {data_root}")
+    data_root = resolve_input_artifact_dir(args.data_root, "data")
 
     index_path = data_root / INDEX_FILE_NAME
     small_files = collect_small_image_files(data_root, args.threshold_mb)

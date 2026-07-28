@@ -6,7 +6,7 @@ import torch
 import nibabel as nib
 from tqdm import tqdm
 
-from configs.global_config import *
+from configs.global_config import CLASS_NAMES, SEED
 
 
 # ================== 工具函数 ==================
@@ -25,11 +25,15 @@ def load_nii_as_tensor(nii_path: Path) -> torch.Tensor:
 
 
 # 目前已弃用
-def collect_cases(seq_id: int, label: int):
+def collect_cases(seq_id: int, label: int, data_root=None):
     """
     从 data/processed/{label}/{seq_id}/ 下收集该序列的所有 case
     """
-    seq_dir = PROCESSED_DATA_PATH / ("1_meningitis" if label == 1 else "0_normal") / str(seq_id)
+    if data_root is None:
+        from runtime_defaults import PROCESSED_DATA_PATH
+
+        data_root = PROCESSED_DATA_PATH
+    seq_dir = Path(data_root) / ("1_meningitis" if label == 1 else "0_normal") / str(seq_id)
     cases = []
 
     for nii_file in sorted(seq_dir.glob(f"case_*_{seq_id}.nii.gz")):
@@ -44,7 +48,7 @@ def collect_cases(seq_id: int, label: int):
 
 
 # 按序列收集 case
-def collect_cases_by_seq(seq_id: int):
+def collect_cases_by_seq(seq_id: int, data_root=None, class_names=None):
     """
     按序列收集 case，返回 dict：
     {
@@ -56,11 +60,17 @@ def collect_cases_by_seq(seq_id: int):
     }
     """
     cases = {}
+    if data_root is None:
+        from runtime_defaults import PROCESSED_DATA_PATH
 
-    for label_id, label_name in enumerate(CLASS_NAMES):
+        data_root = PROCESSED_DATA_PATH
+    data_root = Path(data_root)
+    class_names = CLASS_NAMES if class_names is None else list(class_names)
+
+    for label_id, label_name in enumerate(class_names):
         dir_name = f"{label_id}_{label_name}"
         
-        seq_dir = PROCESSED_DATA_PATH / dir_name / str(seq_id)
+        seq_dir = data_root / dir_name / str(seq_id)
         
         if not seq_dir.exists():
             continue
@@ -88,7 +98,7 @@ def collect_cases_by_seq(seq_id: int):
     return cases
 
 
-def build_dataset(cases):
+def build_dataset(cases, seed=SEED):
     """
     即时加载改造版：不再完整载入并拼接图像张量。
     而是仅返回轻量级的 case 信息（包含 NIfTI 的路径）。
@@ -99,6 +109,6 @@ def build_dataset(cases):
         "meta": {
             "num_samples": len(cases),
             "created_time": datetime.now().isoformat(),
-            "seed": SEED,
+            "seed": seed,
         }
     }

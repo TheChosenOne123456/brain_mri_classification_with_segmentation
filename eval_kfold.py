@@ -13,8 +13,20 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
-from configs.train_config import *
-from configs.global_config import *
+from configs.config_utils import (
+    TRAIN_CONFIG_FIELDS,
+    infer_data_dir,
+    load_python_config,
+    resolve_input_artifact_dir,
+)
+from configs.global_config import (
+    ALL_SEQUENCES,
+    CLASS_NAMES,
+    K_FOLDS,
+    NUM_CLASSES,
+    SEED,
+)
+from runtime_defaults import DATA_EXPERIMENT_ROOT, TRAIN_EXPERIMENT_ROOT
 
 from models.cnn3d import Simple3DCNN
 from models.ResNet import ResNet10, ResNet18
@@ -136,7 +148,10 @@ def evaluate_single_fold(args_seq, model_name, fold_idx, ModelClass):
             print(f"\n[Warning] Checkpoint for fold {fold_idx} not found at {ckpt_path}. Skipping.")
             return None
             
-        test_set = load_pt_dataset(dataset_dir / "test.pt")
+        test_set = load_pt_dataset(
+            dataset_dir / "test.pt",
+            data_root=EVAL_DATA_ROOT,
+        )
         
     else:
         # 多通道模式
@@ -160,7 +175,12 @@ def evaluate_single_fold(args_seq, model_name, fold_idx, ModelClass):
             if not d_dir.exists():
                 print(f"\n[Warning] Dataset missing for sequence {s_name} at {d_dir}. Skipping.")
                 return None
-            test_sets_list.append(load_pt_dataset(d_dir / "test.pt"))
+            test_sets_list.append(
+                load_pt_dataset(
+                    d_dir / "test.pt",
+                    data_root=EVAL_DATA_ROOT,
+                )
+            )
         print(f"Done in {time.time()-t0:.1f}s")
         
         test_set = MultiChannelDataset(test_sets_list)
@@ -321,6 +341,22 @@ def evaluate_single_fold(args_seq, model_name, fold_idx, ModelClass):
 
 # ================== 主流程 ==================
 def main(args):
+    config = load_python_config(args.config, TRAIN_CONFIG_FIELDS)
+    for name in TRAIN_CONFIG_FIELDS:
+        globals()[name] = getattr(config, name)
+
+    dataset_root = resolve_input_artifact_dir(args.data_root, "datasets")
+    ckpt_root = resolve_input_artifact_dir(args.checkpoint_root, "checkpoints")
+    globals()["EVAL_DATA_ROOT"] = infer_data_dir(args.data_root)
+    globals()["DATASET_DIRS"] = [
+        dataset_root / f"seq{seq_id}_{seq_name}"
+        for seq_id, seq_name in enumerate(ALL_SEQUENCES, start=1)
+    ]
+    globals()["CKPT_DIRS"] = [
+        ckpt_root / f"seq{seq_id}_{seq_name}"
+        for seq_id, seq_name in enumerate(ALL_SEQUENCES, start=1)
+    ]
+
     set_seed(SEED)
 
     model_name = args.model
@@ -343,6 +379,9 @@ def main(args):
         seq_name = f"Multi-Fusion ({len(ALL_SEQUENCES)} Channels)"
 
     print(f"\n>>> Starting K-Fold Evaluation for: {seq_name} <<<")
+    print(f"Evaluation config: {config.__config_path__}")
+    print(f"Dataset input   : {dataset_root}")
+    print(f"Checkpoint input: {ckpt_root}")
 
     # ---------- 确定要评估的 fold 列表 ----------
     if args.fold is not None:
@@ -400,6 +439,24 @@ def main(args):
 # ================== CLI ==================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config",
+        default=str(TRAIN_EXPERIMENT_ROOT / "train_config.py"),
+        help="Training config used for runtime device and DataLoader settings",
+    )
+    parser.add_argument(
+        "--data-root",
+        default=str(DATA_EXPERIMENT_ROOT),
+        help="Experiment root containing datasets (default: output/data-hdbet)",
+    )
+    parser.add_argument(
+        "--checkpoint-root",
+        default=str(TRAIN_EXPERIMENT_ROOT),
+        help=(
+            "Training output root containing checkpoints "
+            "(default: output/runs-cross-entropy)"
+        ),
+    )
     # [修改] required=False, 允许为空以触发多通道评估
     parser.add_argument(
         "--seq",

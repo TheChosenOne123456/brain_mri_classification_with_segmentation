@@ -18,7 +18,7 @@ from collections import defaultdict
 project_root = Path(__file__).resolve().parent.parent
 sys.path.append(str(project_root))
 
-from configs.global_config import *
+from runtime_defaults import *
 
 
 MASK_NAME_PAT = re.compile(r"^case_(\d+)_(\d+)_mask\.nii(\.gz)?$")
@@ -247,7 +247,8 @@ def main(args):
     print("\n" + "=" * 72)
     print("Mask Statistics Script")
     print("=" * 72)
-    print(f"EXPERIMENT_VERSION      : {EXPERIMENT_VERSION}")
+    print(f"DATA_EXPERIMENT_ROOT    : {DATA_EXPERIMENT_ROOT}")
+    print(f"TRAIN_EXPERIMENT_ROOT   : {TRAIN_EXPERIMENT_ROOT}")
     print(f"Data root               : {data_root}")
     print(f"Dataset root            : {dataset_root}")
     print(f"Class names             : {CLASS_NAMES}")
@@ -280,13 +281,13 @@ if __name__ == "__main__":
         "--data_root",
         type=str,
         default=str(PROCESSED_DATA_PATH),
-        help="Path to processed data root (e.g. version1/data)"
+        help="Path to processed data root (e.g. output/data-hdbet/data)"
     )
     parser.add_argument(
         "--dataset_root",
         type=str,
         default=str(DATASET_ROOT),
-        help="Path to dataset root (e.g. version1/datasets)"
+        help="Path to dataset root (e.g. output/data-hdbet/datasets)"
     )
     parser.add_argument(
         "--by_fold",

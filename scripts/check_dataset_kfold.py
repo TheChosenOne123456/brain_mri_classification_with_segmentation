@@ -1,107 +1,117 @@
-'''
-检查 K-Fold 数据集分布脚本
-功能：
-1. 直接加载 fold 下的 train.pt / val.pt / test.pt
-2. 读取其中的 label 数据进行统计
-3. 验证是否符合 global_config 中的配置
-'''
+"""检查 K-Fold 数据集的类别分布。"""
 
 import argparse
-import torch
-import sys
-from pathlib import Path
-from collections import Counter
 import warnings
+from collections import Counter
+from pathlib import Path
 
-# 添加项目根目录到 sys.path，确保能导入 config
-project_root = Path(__file__).resolve().parent.parent
-sys.path.append(str(project_root))
+import torch
 
-from configs.global_config import *
+from configs.config_utils import resolve_input_artifact_dir
+from configs.global_config import (
+    ALL_SEQUENCES,
+    CLASS_NAMES,
+    K_FOLDS,
+    NUM_CLASSES,
+)
 
-def check_fold_distribution(dataset_dir):
+
+def extract_labels(dataset_dict):
+    """兼容当前轻量 cases schema 和历史 labels tensor schema。"""
+    if "cases" in dataset_dict:
+        return [int(case["label"]) for case in dataset_dict["cases"]]
+    if "labels" in dataset_dict:
+        labels = dataset_dict["labels"]
+        return labels.tolist() if hasattr(labels, "tolist") else list(labels)
+    raise KeyError("Neither 'cases' nor 'labels' exists in dataset file")
+
+
+def check_sequence_distribution(dataset_dir):
     dataset_dir = Path(dataset_dir).resolve()
-    
-    print(f"\n{'='*60}")
-    print(f"Checking Dataset (from .pt files): {dataset_dir.name}")
-    print(f"Path: {dataset_dir}")
-    print(f"Configs: {NUM_CLASSES} Classes ({CLASS_NAMES})")
-    print(f"{'='*60}")
 
-    if not dataset_dir.exists():
-        print(f"Error: Directory not found: {dataset_dir}")
+    print(f"\n{'=' * 60}")
+    print(f"Checking sequence dataset: {dataset_dir.name}")
+    print(f"Path: {dataset_dir}")
+    print(f"Classes: {NUM_CLASSES} ({CLASS_NAMES})")
+    print(f"{'=' * 60}")
+
+    if not dataset_dir.is_dir():
+        print(f"  [Warning] Directory not found: {dataset_dir}")
         return
 
-    # 遍历所有 Fold
-    for k in range(1, K_FOLDS + 1):
-        fold_name = f"fold{k}"
+    for fold_idx in range(1, K_FOLDS + 1):
+        fold_name = f"fold{fold_idx}"
         fold_dir = dataset_dir / fold_name
-        
         print(f"\n--- {fold_name} ---")
-        if not fold_dir.exists():
+        if not fold_dir.is_dir():
             print(f"  [Warning] {fold_name} dir not found. Skipping.")
             continue
 
-        stats = {
-            "train": Counter(),
-            "val": Counter(),
-            "test": Counter()
-        }
-
-        # 遍历三个集合文件
-        for split_name in ["train", "val", "test"]:
+        stats = {name: Counter() for name in ("train", "val", "test")}
+        for split_name in stats:
             pt_path = fold_dir / f"{split_name}.pt"
-            
-            if not pt_path.exists():
+            if not pt_path.is_file():
                 print(f"  [Warning] {split_name}.pt not found.")
                 continue
-            
             try:
-                # 压制 torch.load 的 weights_only 警告
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
-                    # 根据 utils/dataset.py，加载得到的是一个字典
-                    dataset_dict = torch.load(pt_path)
-                
-                # 直接从字典中获取标签 Tensor
-                if "labels" in dataset_dict:
-                    labels_tensor = dataset_dict["labels"]
-                    labels_list = labels_tensor.tolist()
-                    stats[split_name].update(labels_list)
-                else:
-                    print(f"  [Error] Key 'labels' not found in {split_name}.pt")
-                
-            except Exception as e:
-                print(f"  [Error] Failed to load {split_name}.pt: {e}")
+                    dataset_dict = torch.load(
+                        pt_path,
+                        map_location="cpu",
+                        weights_only=False,
+                    )
+                stats[split_name].update(extract_labels(dataset_dict))
+            except Exception as exc:
+                print(f"  [Error] Failed to load {pt_path.name}: {exc}")
 
-        # 打印表头
-        header_labels = [f"{name}({idx})" for idx, name in enumerate(CLASS_NAMES)]
-        header = f"  {'Split':<8} | " + " | ".join([f"{hl:<15}" for hl in header_labels]) + f" | {'Total':<8}"
+        header_labels = [
+            f"{class_name}({label_id})"
+            for label_id, class_name in enumerate(CLASS_NAMES)
+        ]
+        header = (
+            f"  {'Split':<8} | "
+            + " | ".join(f"{label:<15}" for label in header_labels)
+            + f" | {'Total':<8}"
+        )
         print(header)
-        print(f"  {'-'*len(header)}")
+        print(f"  {'-' * len(header)}")
 
-        # 打印每行数据
-        for split_name in ["train", "val", "test"]:
-            row_str = f"  {split_name:<8} | "
-            total_count = 0
-            
-            for label_id in range(NUM_CLASSES):
-                count = stats[split_name].get(label_id, 0)
-                row_str += f"{count:<15} | "
-                total_count += count
-            
-            row_str += f"{total_count:<8}"
-            print(row_str)
+        for split_name in ("train", "val", "test"):
+            counts = [
+                stats[split_name].get(label_id, 0)
+                for label_id in range(NUM_CLASSES)
+            ]
+            row = " | ".join(f"{count:<15}" for count in counts)
+            print(f"  {split_name:<8} | {row} | {sum(counts):<8}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Check class distributions in K-Fold .pt datasets"
+    )
+    parser.add_argument(
+        "--data-root",
+        required=True,
+        help="Experiment root containing datasets, or the datasets directory itself",
+    )
+    parser.add_argument(
+        "--seq",
+        type=int,
+        choices=range(1, len(ALL_SEQUENCES) + 1),
+        default=None,
+        help="Only check one sequence; default checks all sequences",
+    )
+    args = parser.parse_args()
+
+    dataset_root = resolve_input_artifact_dir(args.data_root, "datasets")
+    seq_ids = [args.seq] if args.seq is not None else range(1, len(ALL_SEQUENCES) + 1)
+
+    print(f"Dataset root: {dataset_root}")
+    for seq_id in seq_ids:
+        seq_name = ALL_SEQUENCES[seq_id - 1]
+        check_sequence_distribution(dataset_root / f"seq{seq_id}_{seq_name}")
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Check K-Fold dataset class distribution from .pt files")
-    parser.add_argument(
-        "--path", 
-        type=str, 
-        required=True, 
-        help="Path to the sequence dataset directory (e.g., datasets/seq1_T1)"
-    )
-    
-    args = parser.parse_args()
-    
-    check_fold_distribution(args.path)
+    main()

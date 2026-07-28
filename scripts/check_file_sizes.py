@@ -4,9 +4,8 @@
 只检查文件大小，不读取体素内容；用于快速发现明显过小的输出文件。
 
 示例：
-    python -m scripts.check_file_sizes
-    python -m scripts.check_file_sizes --threshold_mb 1
-    python -m scripts.check_file_sizes --threshold_mb 2 --csv_path version1/file_size_lt2mb.csv
+    python -m scripts.check_file_sizes --data-root dataxxx
+    python -m scripts.check_file_sizes --data-root dataxxx --threshold-mb 1
 """
 
 import argparse
@@ -14,7 +13,8 @@ import csv
 from collections import Counter
 from pathlib import Path
 
-from configs.global_config import ALL_SEQUENCES, CLASS_NAMES, PROCESSED_DATA_PATH
+from configs.config_utils import resolve_input_artifact_dir
+from configs.global_config import ALL_SEQUENCES, CLASS_NAMES
 
 
 def parse_file(path: Path, data_root: Path):
@@ -49,14 +49,18 @@ def parse_file(path: Path, data_root: Path):
 
 def main():
     parser = argparse.ArgumentParser(description="Check preprocessed NIfTI file sizes.")
-    parser.add_argument("--data_root", type=str, default=str(PROCESSED_DATA_PATH))
-    parser.add_argument("--threshold_mb", type=float, default=2.0)
-    parser.add_argument("--csv_path", type=str, default="")
-    parser.add_argument("--include_masks", action="store_true")
-    parser.add_argument("--limit_print", type=int, default=30)
+    parser.add_argument(
+        "--data-root",
+        required=True,
+        help="Experiment root containing data, or the data directory itself",
+    )
+    parser.add_argument("--threshold-mb", type=float, default=2.0)
+    parser.add_argument("--csv-path", type=str, default="")
+    parser.add_argument("--include-masks", action="store_true")
+    parser.add_argument("--limit-print", type=int, default=30)
     args = parser.parse_args()
 
-    data_root = Path(args.data_root)
+    data_root = resolve_input_artifact_dir(args.data_root, "data")
     rows = []
 
     for path in sorted(data_root.glob("*/*/case_*.nii.gz")):

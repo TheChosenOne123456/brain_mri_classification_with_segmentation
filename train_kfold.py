@@ -20,10 +20,20 @@ except ImportError:
 
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-from pathlib import Path
 
-from configs.train_config import *
-from configs.global_config import *
+from configs.config_utils import (
+    TRAIN_CONFIG_FIELDS,
+    infer_data_dir,
+    load_python_config,
+    resolve_input_artifact_dir,
+    resolve_output_artifact_dir,
+)
+from configs.global_config import (
+    ALL_SEQUENCES,
+    K_FOLDS,
+    NUM_CLASSES,
+    SEED,
+)
 from models.cnn3d import Simple3DCNN
 from models.ResNet import ResNet10, ResNet18
 from models.FoundationModel import FoundationModel
@@ -33,6 +43,12 @@ from utils.train_and_test import set_seed, load_pt_dataset
 
 import warnings
 warnings.filterwarnings("ignore", message="You are using `torch.load` with `weights_only=False`")
+
+
+def apply_train_config(config):
+    """让训练循环继续使用原有同名常量，避免改动核心训练流程。"""
+    for name in TRAIN_CONFIG_FIELDS:
+        globals()[name] = getattr(config, name)
 
 
 def get_classification_loss_metadata(criterion, class_counts):
@@ -62,6 +78,47 @@ def get_classification_loss_metadata(criterion, class_counts):
 
     metadata["classification_loss"] = criterion.__class__.__name__
     return metadata
+
+
+def build_classification_criterion(class_counts, total_samples):
+    """根据训练配置创建分类损失；默认分支完全复刻原加权交叉熵。"""
+    if torch.any(class_counts <= 0):
+        raise ValueError(
+            f"Every class needs training samples, got {class_counts.tolist()}"
+        )
+
+    if CLASSIFICATION_LOSS == "cross_entropy":
+        criterion = nn.CrossEntropyLoss()
+        print("Classification Loss: CrossEntropyLoss")
+        return criterion.to(DEVICE)
+
+    if CLASSIFICATION_LOSS == "weighted_cross_entropy":
+        raw_weights = total_samples / (NUM_CLASSES * class_counts.float() + 1e-6)
+        class_weights = torch.pow(raw_weights, CLASS_WEIGHT_POWER).to(DEVICE)
+        print(f"Class Weights: {class_weights.tolist()}")
+        print(
+            "Classification Loss: weighted CrossEntropyLoss "
+            f"(power={CLASS_WEIGHT_POWER})"
+        )
+        return nn.CrossEntropyLoss(weight=class_weights)
+
+    if CLASSIFICATION_LOSS == "class_balanced_focal":
+        criterion = ClassBalancedFocalLoss(
+            samples_per_class=class_counts,
+            beta=CLASS_BALANCE_BETA,
+            gamma=FOCAL_GAMMA,
+        ).to(DEVICE)
+        print(f"Class-Balanced Weights: {criterion.class_weights.tolist()}")
+        print(
+            "Classification Loss: ClassBalancedFocalLoss "
+            f"(beta={CLASS_BALANCE_BETA}, gamma={FOCAL_GAMMA})"
+        )
+        return criterion
+
+    raise ValueError(
+        f"Unsupported CLASSIFICATION_LOSS: {CLASSIFICATION_LOSS}. "
+        "Expected cross_entropy, weighted_cross_entropy, or class_balanced_focal."
+    )
 
 
 def compute_dice(pred_mask, gt_mask, num_classes=3, smooth=1e-5):
@@ -166,10 +223,33 @@ def calculate_accuracy(loader, model, device):
     return correct / total
 
 def main(args):
+    config = load_python_config(args.config, TRAIN_CONFIG_FIELDS)
+    apply_train_config(config)
+
+    dataset_root = resolve_input_artifact_dir(args.data_root, "datasets")
+    processed_data_root = infer_data_dir(args.data_root)
+    ckpt_root = resolve_output_artifact_dir(args.output_root, "checkpoints")
+    dataset_dirs = [
+        dataset_root / f"seq{seq_id}_{seq_name}"
+        for seq_id, seq_name in enumerate(ALL_SEQUENCES, start=1)
+    ]
+    ckpt_dirs = [
+        ckpt_root / f"seq{seq_id}_{seq_name}"
+        for seq_id, seq_name in enumerate(ALL_SEQUENCES, start=1)
+    ]
+
     set_seed(SEED)
     
     current_fold = args.fold
     model_name = args.model
+
+    print(f"Training config : {config.__config_path__}")
+    print(f"Dataset input   : {dataset_root}")
+    print(f"Checkpoint root : {ckpt_root}")
+    train_config_snapshot = {
+        name: getattr(config, name)
+        for name in TRAIN_CONFIG_FIELDS
+    }
     
     if args.seq is not None:
         # ---- 单通道模式 ----
@@ -179,8 +259,8 @@ def main(args):
         in_channels = 1
         print(f"\n=== Training Fold {current_fold}/{K_FOLDS} | Seq: {seq_name} | Model: {model_name} (1-Channel) ===")
 
-        dataset_dir = DATASET_DIRS[seq_idx] / f"fold{current_fold}"
-        ckpt_dir = CKPT_DIRS[seq_idx] / model_name
+        dataset_dir = dataset_dirs[seq_idx] / f"fold{current_fold}"
+        ckpt_dir = ckpt_dirs[seq_idx] / model_name
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
         if not dataset_dir.exists():
@@ -189,8 +269,14 @@ def main(args):
             sys.exit(1)
 
         # 加载数据
-        train_set = load_pt_dataset(dataset_dir / "train.pt")
-        val_set   = load_pt_dataset(dataset_dir / "val.pt")
+        train_set = load_pt_dataset(
+            dataset_dir / "train.pt",
+            data_root=processed_data_root,
+        )
+        val_set = load_pt_dataset(
+            dataset_dir / "val.pt",
+            data_root=processed_data_root,
+        )
 
     else:
         # ---- 多通道模式 ----
@@ -202,19 +288,29 @@ def main(args):
         val_sets_list = []
         
         for idx, s_name in enumerate(ALL_SEQUENCES):
-            dataset_dir = DATASET_DIRS[idx] / f"fold{current_fold}"
+            dataset_dir = dataset_dirs[idx] / f"fold{current_fold}"
             if not dataset_dir.exists():
                 print(f"Error: Dataset missing for sequence {s_name} at {dataset_dir}")
                 sys.exit(1)
-            train_sets_list.append(load_pt_dataset(dataset_dir / "train.pt"))
-            val_sets_list.append(load_pt_dataset(dataset_dir / "val.pt"))
+            train_sets_list.append(
+                load_pt_dataset(
+                    dataset_dir / "train.pt",
+                    data_root=processed_data_root,
+                )
+            )
+            val_sets_list.append(
+                load_pt_dataset(
+                    dataset_dir / "val.pt",
+                    data_root=processed_data_root,
+                )
+            )
 
         # 使用我们自定义的代理类包装
         train_set = MultiChannelDataset(train_sets_list)
         val_set   = MultiChannelDataset(val_sets_list)
 
         # 把多通道模型统一保存在独立路径中
-        base_ckpt_dir = CKPT_DIRS[0].parent  # 例如 checkpoints/
+        base_ckpt_dir = ckpt_root
         ckpt_dir = base_ckpt_dir / "multi_channel" / model_name
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -251,29 +347,9 @@ def main(args):
         model = nn.DataParallel(model)
 
     all_labels = train_set.labels.tolist() if isinstance(train_set.labels, torch.Tensor) else list(train_set.labels)
-    # class_counts = torch.bincount(torch.as_tensor(all_labels), minlength=NUM_CLASSES)
-
-    # # 每个 fold 只使用自身训练集计数，避免验证集或测试集信息泄漏。
-    # criterion = ClassBalancedFocalLoss(
-    #     samples_per_class=class_counts,
-    #     beta=CLASS_BALANCE_BETA,
-    #     gamma=FOCAL_GAMMA,
-    # ).to(DEVICE)
-    # print(f"Class Counts: {class_counts.tolist()}")
-    # print(f"Class-Balanced Weights: {criterion.class_weights.detach().cpu().tolist()}")
-    # print(f"Focal Loss: beta={CLASS_BALANCE_BETA}, gamma={FOCAL_GAMMA}")
     class_counts = torch.bincount(torch.tensor(all_labels), minlength=NUM_CLASSES)
-
-    # 权重计算
     total_samples = len(all_labels)
-    raw_weights = total_samples / (NUM_CLASSES * class_counts.float() + 1e-6)
-    class_weights = torch.pow(raw_weights, 0.5)
-
-    # 将权重转到 device
-    class_weights = class_weights.to(DEVICE)
-    print(f"Class Weights: {class_weights.tolist()}")
-
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    criterion = build_classification_criterion(class_counts, total_samples)
 
     # 在设备上创建一个极其侧重类别 1 和 2 的权重
     # 假设背景权重很小(0.1)，炎症权重10.0，转移瘤权重10.0
@@ -448,6 +524,9 @@ def main(args):
                 "val_loss": best_val_loss,
                 "val_acc": val_acc,
                 "val_f1": val_f1,
+                "train_config_path": str(config.__config_path__),
+                "train_config": train_config_snapshot,
+                "dataset_root": str(dataset_root),
                 **get_classification_loss_metadata(criterion, class_counts),
             }, best_model_path)
             # 即使在 MIN_EPOCHS 内，也保存更好的模型
@@ -468,6 +547,21 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config",
+        required=True,
+        help="Path to a train_config.py file",
+    )
+    parser.add_argument(
+        "--data-root",
+        required=True,
+        help="Experiment root containing DATA_ROOT/datasets, or datasets itself",
+    )
+    parser.add_argument(
+        "--output-root",
+        required=True,
+        help="Training output root; weights are written to OUTPUT_ROOT/checkpoints",
+    )
     # [修改] required=False 表示如果命令行不打 --seq 就是多通道
     parser.add_argument("--seq", type=int, required=False, default=None, help="Sequence ID (1-3). Leave empty for ALL channels.")
     parser.add_argument("--model", type=str, required=True, choices=["cnn3d", "ResNet", "ResNet18", "FoundationModel", "FoundationModel_ori"])

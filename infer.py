@@ -1,7 +1,7 @@
 '''
 临床 K-Fold 异构集成推理脚本 (Clinical Inference via Heterogeneous Late Fusion)：
 输入一个已经被预处理过的 Case ID（如 "0001"），脚本将：
-- 自动在当前实验版本目录(version1/data)下检索其 Seq1, Seq2, Seq3 的图像。
+- 自动在当前默认数据实验目录(output/data-hdbet/data)下检索其 Seq1, Seq2, Seq3 的图像。
 - Seq1 和 Seq2 使用原版无分割模型 (FoundationModel_ori) 提取概率。
 - Seq3 使用多任务模型 (FoundationModel) 提取概率并输出病灶分割 Mask。
 - 最终打印三模态的融合投票结果，并将 Mask 保存到当前目录的 /infer_output 下。
@@ -17,8 +17,7 @@ import nibabel as nib
 import numpy as np
 from pathlib import Path
 
-from configs.train_config import *
-from configs.global_config import *
+from runtime_defaults import *
 
 from models.FoundationModel import FoundationModel
 from models.FoundationModel_ori import FoundationModel as FoundationModel_ori
@@ -32,7 +31,7 @@ warnings.filterwarnings(
 )
 
 # 定义最终 Mask 的输出目录
-OUTPUT_DIR = Path(EXPERIMENT_VERSION) / "infer_output"
+OUTPUT_DIR = TRAIN_EXPERIMENT_ROOT / "infer_output"
 
 def find_case_files(case_id, data_root):
     """
@@ -111,7 +110,7 @@ def main(args):
     case_id = args.id
     target_folds = [args.fold] if args.fold is not None else range(1, K_FOLDS + 1)
     
-    data_root = PROCESSED_DATA_PATH # e.g. version1/data
+    data_root = PROCESSED_DATA_PATH
     
     # ---------- 1. 查找并加载患者数据 ----------
     nii_paths, groundtruth = find_case_files(case_id, data_root)

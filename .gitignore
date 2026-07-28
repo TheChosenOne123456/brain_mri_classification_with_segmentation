@@ -1,3 +1,6 @@
+# 所有新实验配置和产物统一放在这里
+/output/
+
 **/data/
 **/__pycache__/
 datasets/
@@ -12,3 +15,4 @@ version*/
 **/*output*/
 **/*output/
 AGENTS.md
+raw_data_info.txt

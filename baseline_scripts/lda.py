@@ -22,7 +22,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.append(str(ROOT_DIR))
 
 from utils.train_and_test import load_pt_dataset
-from configs.global_config import DATASET_ROOT, K_FOLDS, ALL_SEQUENCES, CLASS_NAMES
+from runtime_defaults import ALL_SEQUENCES, CLASS_NAMES, DATASET_ROOT, K_FOLDS
 
 def extract_features_and_labels(dataloader, desc="Extracting"):
     features = []

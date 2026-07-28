@@ -28,7 +28,14 @@ from sklearn.metrics import (
 from torch.utils.data import DataLoader, Dataset
 
 from configs.global_config import ALL_SEQUENCES, CLASS_NAMES, K_FOLDS, NUM_CLASSES
-from configs.train_config import BATCH_SIZE, CKPT_DIRS, DATASET_DIRS, DEVICE, NUM_WORKERS
+from runtime_defaults import (
+    BATCH_SIZE,
+    CKPT_DIRS,
+    DATASET_DIRS,
+    DEVICE,
+    INFERENCE_OUTPUT_DIR,
+    NUM_WORKERS,
+)
 from models.FoundationModel import FoundationModel
 from models.FoundationModel_ori import FoundationModel as FoundationModel_ori
 from utils.train_and_test import load_pt_dataset, set_seed
@@ -234,7 +241,7 @@ def evaluate_internal(args, weights):
 
 
 def discover_external_csvs():
-    output_dir = Path("version1/inference_outputs")
+    output_dir = INFERENCE_OUTPUT_DIR
     if not output_dir.exists():
         return []
     return sorted(output_dir.glob("external_eval_*_foldsall.csv"))
@@ -375,7 +382,7 @@ if __name__ == "__main__":
         "--external_csvs",
         nargs="*",
         default=None,
-        help="Optional external diagnostic CSV files. If omitted, auto-discover version1/inference_outputs/external_eval_*_foldsall.csv.",
+        help="Optional external diagnostic CSV files. If omitted, auto-discover them in the default training experiment's inference_outputs.",
     )
     parser.add_argument(
         "--skip_internal",
@@ -404,6 +411,6 @@ if __name__ == "__main__":
         type=str,
         default=None,
         choices=["cuda", "cpu"],
-        help="Evaluation device. Defaults to configs.train_config.DEVICE, with automatic CPU fallback if CUDA is unavailable.",
+        help="Evaluation device. Defaults to the migrated training experiment config, with automatic CPU fallback if CUDA is unavailable.",
     )
     main(parser.parse_args())

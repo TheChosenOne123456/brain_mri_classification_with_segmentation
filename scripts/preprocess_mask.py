@@ -12,17 +12,13 @@ mask 预处理只读取 JSON metadata，不重新运行 HD-BET：
     5. 保存到对应已预处理图像旁边。
 
 用法：
-    # 使用 configs/global_config.py 中的 MASK_ROOTS、RAW_DATA_PATH、PROCESSED_DATA_PATH
-    python -m scripts.preprocess_mask
-
-    # 指定 mask 路径和输出 data 路径
     python -m scripts.preprocess_mask \
-        --mask_roots /path/to/mask_root1 /path/to/mask_root2 \
-        --out_root version1/data
+        --config dataxxx/preprocessing_config.py \
+        --data-root dataxxx
 
     # 默认会清理旧的 *_mask.nii.gz 和 mask_index.json 后重建；
     # 如果只想增量追加，可加 --no-clear_existing_masks
-    python -m scripts.preprocess_mask --no-clear_existing_masks
+    python -m scripts.preprocess_mask ... --no-clear-existing-masks
 """
 
 import argparse
@@ -35,7 +31,12 @@ from tqdm import tqdm
 
 sitk.ProcessObject_SetGlobalWarningDisplay(False)
 
-from configs.global_config import *
+from configs.config_utils import (
+    PREPROCESS_CONFIG_FIELDS,
+    load_python_config,
+    resolve_input_artifact_dir,
+)
+from configs.global_config import MASK_ROOTS
 from utils.data_scan import collect_cases
 from utils.io import INDEX_FILE_NAME, MASK_INDEX_FILE_NAME, load_index, save_index
 from utils.resample import resample_to_reference, save_image
@@ -133,7 +134,8 @@ def image_geometry_matches(img_a, img_b, atol=1e-5):
 
 
 def main(args):
-    out_root = Path(args.out_root).resolve()
+    config = load_python_config(args.config, PREPROCESS_CONFIG_FIELDS)
+    out_root = resolve_input_artifact_dir(args.data_root, "data")
     mask_roots = [Path(p).resolve() for p in args.mask_roots]
     mask_roots = [p for p in mask_roots if p.exists()]
 
@@ -147,6 +149,7 @@ def main(args):
         return
 
     print("=== 开始处理 Mask 数据 ===")
+    print(f"Preprocessing config: {config.__config_path__}")
     print(f"Data out root : {out_root}")
     print(f"Mask roots    : {[str(p) for p in mask_roots]}")
 
@@ -252,19 +255,23 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Preprocess brain MRI lesion masks")
     parser.add_argument(
-        "--mask_roots",
+        "--config",
+        required=True,
+        help="Path to the preprocessing_config.py used for the image data",
+    )
+    parser.add_argument(
+        "--data-root",
+        required=True,
+        help="Experiment root containing data, or the data directory itself",
+    )
+    parser.add_argument(
+        "--mask-roots",
         nargs="+",
         default=[str(p) for p in MASK_ROOTS],
         help="提供包含 MASK 文件的原始路径列表，可接收多个",
     )
     parser.add_argument(
-        "--out_root",
-        type=str,
-        default=str(PROCESSED_DATA_PATH),
-        help="现有的预处理数据输出路径",
-    )
-    parser.add_argument(
-        "--clear_existing_masks",
+        "--clear-existing-masks",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="先清理旧的 *_mask.nii.gz 和 mask_index.json，再重建",

@@ -8,6 +8,7 @@ dataset/seq1_T1/fold1/split.json
 '''
 import json
 import random
+import argparse
 from collections import Counter
 
 import numpy as np
@@ -16,7 +17,19 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 
 # 导入复用函数
 from utils.dataset import build_dataset, collect_cases_by_seq
-from configs.global_config import *
+from configs.config_utils import (
+    DATASET_CONFIG_FIELDS,
+    load_python_config,
+    resolve_input_artifact_dir,
+    resolve_output_artifact_dir,
+)
+from configs.global_config import (
+    ALL_SEQUENCES,
+    CLASS_NAMES,
+    K_FOLDS,
+    NUM_CLASSES,
+    SEED,
+)
 
 
 def get_aligned_labels(case_ids, seq_case_maps):
@@ -56,16 +69,34 @@ def print_split_counts(split_name, labels):
     print(f"  {split_name:<5}: {len(labels):>4} | {counts_text}")
 
 
-def main():
+def main(args):
+    config = load_python_config(args.config, DATASET_CONFIG_FIELDS)
+    val_ratio = config.K_FOLDS_VAL_RATIO
+    if not (0 < val_ratio < 1):
+        raise ValueError(
+            f"K_FOLDS_VAL_RATIO must be between 0 and 1, got {val_ratio}"
+        )
+
+    data_root = resolve_input_artifact_dir(args.data_root, "data")
+    dataset_root = resolve_output_artifact_dir(args.output_root, "datasets")
+
     # 保证划分可复现
     random.seed(SEED)
     np.random.seed(SEED)
+
+    print(f"Dataset config : {config.__config_path__}")
+    print(f"Data input     : {data_root}")
+    print(f"Dataset output : {dataset_root}")
     
     # 1. 收集并对齐所有序列的 Case
     print("\n[STEP 1] Collecting and aligning cases...")
     seq_case_maps = {}
     for seq_id, seq_name in enumerate(ALL_SEQUENCES, start=1):
-        seq_case_maps[seq_id] = collect_cases_by_seq(seq_id)
+        seq_case_maps[seq_id] = collect_cases_by_seq(
+            seq_id,
+            data_root=data_root,
+            class_names=CLASS_NAMES,
+        )
         print(f"  Seq {seq_id} ({seq_name}): {len(seq_case_maps[seq_id])} cases")
     
     # 取交集
@@ -118,7 +149,7 @@ def main():
         #  Val 占 (Train+Val) 的 K_FOLDS_VAL_RATIO 比例
         train_sub_idx, val_sub_idx = train_test_split(
             train_val_idx,
-            test_size=K_FOLDS_VAL_RATIO,
+            test_size=val_ratio,
             random_state=SEED,
             shuffle=True,
             stratify=all_labels_np[train_val_idx]
@@ -141,12 +172,23 @@ def main():
             seq_cases = seq_case_maps[seq_id]
             
             # 根据 ID 提取 Case 对象
-            train_data = build_dataset([seq_cases[cid] for cid in fold_train_ids])
-            val_data   = build_dataset([seq_cases[cid] for cid in fold_val_ids])
-            test_data  = build_dataset([seq_cases[cid] for cid in fold_test_ids])
+            train_data = build_dataset(
+                [seq_cases[cid] for cid in fold_train_ids],
+                seed=SEED,
+            )
+            val_data = build_dataset(
+                [seq_cases[cid] for cid in fold_val_ids],
+                seed=SEED,
+            )
+            test_data = build_dataset(
+                [seq_cases[cid] for cid in fold_test_ids],
+                seed=SEED,
+            )
 
             # 保存路径： datasets/seq1_T1/fold1/
-            fold_dir = DATASET_ROOT / (f"seq{seq_id}_{seq_name}") / f"fold{fold_idx}"
+            fold_dir = (
+                dataset_root / f"seq{seq_id}_{seq_name}" / f"fold{fold_idx}"
+            )
             fold_dir.mkdir(parents=True, exist_ok=True)
 
             torch.save(train_data, fold_dir / "train.pt")
@@ -159,6 +201,8 @@ def main():
                 "sequence": seq_name,
                 "split_strategy": "StratifiedKFold + stratified train/val split",
                 "seed": SEED,
+                "dataset_config": str(config.__config_path__),
+                "data_root": str(data_root),
                 "train_ids": fold_train_ids.tolist(),
                 "val_ids": fold_val_ids.tolist(),
                 "test_ids": fold_test_ids.tolist(),
@@ -176,4 +220,20 @@ def main():
     print("\n[SUCCESS] K-Fold datasets building finished.")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Build aligned K-Fold datasets")
+    parser.add_argument(
+        "--config",
+        required=True,
+        help="Path to a dataset_config.py file",
+    )
+    parser.add_argument(
+        "--data-root",
+        required=True,
+        help="Experiment root containing DATA_ROOT/data, or the data directory itself",
+    )
+    parser.add_argument(
+        "--output-root",
+        required=True,
+        help="Experiment root; split files are written to OUTPUT_ROOT/datasets",
+    )
+    main(parser.parse_args())
