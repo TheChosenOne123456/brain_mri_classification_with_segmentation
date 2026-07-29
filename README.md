@@ -59,6 +59,7 @@
 ├── infer.py
 ├── read_kfold_pth.py
 ├── train_kfold.py
+├── train_meta_fusion.py
 ├── deprecated_train.py
 ├── runtime_defaults.py        # 尚未完全参数化入口的迁移后默认实验
 ├── output                    # 新实验配置与产物，整体被 Git 忽略
@@ -81,10 +82,11 @@
 5. train_kfold.py：训练脚本，配合k折交叉验证使用
 6. eval_kfold.py：单序列或多通道模型测试脚本，先计算每一折的结果，再综合评估
 7. eval.py：当前最优异构晚期融合软投票测试脚本；eval_vote_kfold.py保留为同构模型软投票评估脚本
-8. infer.py / infer_kfold.py：预测脚本，支持临床晚期融合推理和k折单例推理
-9. `deprecated_train.py`：旧的非 K-Fold 训练入口，仅用于明确提示迁移到 `train_kfold.py`
-10. 原 `version1` 产物已迁移到 `output/data-hdbet` 和 `output/runs-cross-entropy`，目录组织与新规范一致
-11. environment.yml：项目用的conda虚拟环境
+8. `train_meta_fusion.py`：使用跨折 OOF 概率选择三个非负模态权重和转移阈值；固定等权 normal gate，并对每个目标 fold 做无标签泄漏的 cross-fitted 评估
+9. infer.py / infer_kfold.py：预测脚本，支持临床晚期融合推理和k折单例推理
+10. `deprecated_train.py`：旧的非 K-Fold 训练入口，仅用于明确提示迁移到 `train_kfold.py`
+11. 原 `version1` 产物已迁移到 `output/data-hdbet` 和 `output/runs-cross-entropy`，目录组织与新规范一致
+12. environment.yml：项目用的conda虚拟环境
 
 ## 实验过程
 
@@ -332,6 +334,29 @@ python eval.py \
     --config output/runs-cross-entropy/train_config.py \
     --data-root output/data-hdbet \
     --checkpoint-root output/runs-cross-entropy
+
+# 训练受约束的 cross-fitted OOF 晚期融合器。
+# 每个目标 fold 使用另外四折的 OOF-test 概率选择三个模态权重和转移阈值；
+# normal gate 固定为等权融合。结果写入 reports/constrained_oof。
+python train_meta_fusion.py \
+    --config output/runs-meta-linear/meta_fusion_config.py \
+    --data-root output/data-hdbet \
+    --checkpoint-roots \
+        output/runs-cross-entropy \
+        output/runs-cross-entropy \
+        output/runs-cross-entropy \
+    --output-root output/runs-meta-linear
+
+# 只报告 fold 1；由于训练来源是另外四折，仍会生成所有缺失的 test 概率缓存。
+python train_meta_fusion.py \
+    --config output/runs-meta-linear/meta_fusion_config.py \
+    --data-root output/data-hdbet \
+    --checkpoint-roots \
+        output/runs-cross-entropy \
+        output/runs-cross-entropy \
+        output/runs-cross-entropy \
+    --output-root output/runs-meta-linear \
+    --fold 1
 ```
 
 ## 使用的数据和最佳的结果
@@ -442,28 +467,42 @@ Fold 5:
 
 ### 外部验证结果与泛化分析
 
-外部验证使用`external_eval.py`，该流程对外部数据即时执行与原始数据一致的预处理步骤：重采样、Z-score归一化、中心裁剪/填充，然后使用当前最佳异构模型进行三序列软投票。脚本会额外输出诊断CSV，包含每个病例、每个fold、每个序列模型的三类概率，以及fold内投票和最终跨fold平均后的预测结果；兼容入口默认保存到 `output/runs-cross-entropy/inference_outputs/`，也可以通过`--csv_path`指定。
+外部验证使用`external_eval.py`。脚本现在直接复用内部预处理入口及指定的
+`preprocessing_config.py`，包括 HD-BET、前景强度归一化、前景中心裁剪/填充和相同的
+`[Z, Y, X]` 模型轴顺序，再使用当前异构模型做三序列软投票。输出诊断 CSV 包含每个病例、
+每个 fold、每个序列模型的三类概率，以及 fold 内投票和跨 fold 平均后的预测结果。
+
+```bash
+python external_eval.py \
+    --preprocess-config output/data-hdbet/preprocessing_config.py \
+    --checkpoint-root output/runs-cross-entropy \
+    --output-root output/runs-cross-entropy \
+    --data-root /path/to/external_cases \
+    --label 2
+```
+
+下面两行是修复前旧脚本产生的历史记录。旧脚本没有完整复用 HD-BET 预处理，而且输入轴顺序
+与内部数据加载器不一致，因此这些数值不能作为修复后流程的外部基线，也不能据此判断真实域偏移；
+在相同外部数据上重新运行上述命令后再更新结论。
 
 | 外部数据类别 | 样本数 | Accuracy / Recall | 预测为normal | 预测为inflammation | 预测为metastasis |
 |-------------|--------|-------------------|--------------|--------------------|------------------|
 | metastasis | 33 | 39.39% | 0 | 20 | 13 |
 | inflammation | 45 | 93.33% | 0 | 42 | 3 |
 
-这说明外部有病样例基本没有混向正常类，模型仍能识别“异常/有病”的大方向；主要问题是外部脑膜转移病例大量被判成炎症，即`metastasis -> inflammation`。
-
-外部表现下降更像是“域偏移 + 类别不均衡 + 炎症/转移瘤影像相似性”叠加，而不是单一代码错误：
+待修复后的外部结果产生后，可以依次检查以下可能因素：
 
 1. 内部K-fold验证来自同一数据源和同一采集/标注分布，训练集和测试集虽然按case划分，但仍属于同分布验证。外部数据来自另一批病例，扫描协议、设备、层厚、FOV、增强时相、病灶形态和诊断边界都可能发生变化，因此内部K-fold结果不能直接等价于外部泛化能力。
 2. 训练数据中炎症样本显著多于转移瘤样本。虽然训练时使用了sqrt反比类别权重，并用macro-F1作为早停指标，但内部测试已经显示metastasis recall明显低于normal和inflammation。外部数据只要稍微偏离内部转移瘤分布，模型就更容易回退到数量更多、形态覆盖更广的炎症类。
-3. 预处理流程统一了spacing、强度尺度和输入尺寸，但不能消除真实域差异。全图Z-score会抹平一部分设备强度差异，但也可能改变外部数据中病灶与背景的相对对比；中心裁剪/填充假设关键区域位于较稳定的中心区域，如果外部病例FOV或病灶分布不同，病灶信息可能被削弱。
+3. 即使预处理流程已经一致，也不能消除真实域差异；仍需要结合修复后的 per-case/per-fold/per-sequence 概率判断偏差来源。
 4. 当前mask辅助只作用于seq3/FLAIR，seq1和seq2采用不带mask的旧分类模型。外部域偏移下，三个序列等权soft voting不一定仍是最优组合；如果seq1/seq2在外部数据上更偏炎症，等权平均可能抵消seq3分割辅助带来的转移瘤证据。
-5. 当前软投票直接平均softmax概率，没有基于外部数据进行温度校准、阈值校准、类别先验校正或加权融合。内部验证中可分的概率边界，在外部数据上可能整体向炎症类偏移。
+5. 外部标签只用于独立评估时，不应直接在同一批外部测试数据上训练融合权重或选择阈值；如需外部域适配，应另外划分校准/微调集。
 
 后续可以优先做以下分析和改进：
 
 1. 优先查看诊断CSV，确认外部metastasis错例是所有分支都偏炎症，还是某个序列/某个fold主导了偏差。
 2. 单独统计外部metastasis病例的metastasis概率分布，判断这些病例是完全被炎症压制，还是接近分类阈值。
-3. 尝试外部验证集上的温度校准、类别阈值调整、加权soft voting，或以metastasis recall为优先目标选择融合权重。
+3. 在独立校准集上尝试温度校准、类别阈值调整、加权 soft voting，或以 metastasis recall 为优先目标选择融合权重。
 4. 如果能获得少量外部标注数据，优先做小规模域适配或微调，而不是只依赖内部K-fold结果。
 
 ## 新特性：基于掩码（Mask）特征辅助的多任务学习网络

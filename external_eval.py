@@ -1,21 +1,35 @@
-'''
-外部独立数据集验证脚本 (End-to-End)
-- 遍历外部数据集，提取带有 T1, T2, FLAIR 三种序列的患者目录
-- 即时自动应用重采样、归一化和裁剪等预处理流程
-- 使用加载的训练好的单通道异构模型进行软投票 (Heterogeneous Late Fusion & Soft Voting)
-- 直接输出该数据类别的预测分布以及整体判定准确率
-'''
+"""外部独立数据集端到端验证。
 
-# /home/ailab/data/brainMRI/脑膜转移_外院测试/
-# /home/ailab/data/brainMRI/脑炎_外院测试/
-# 运行示例：
-# python external_eval.py --data_root <外部数据目录> --label <类别编号>
+外部原始 NIfTI 会严格复用内部 ``preprocess_data.py`` 的预处理函数：
+resample -> HD-BET -> mask 内归一化 -> mask 外置零 -> 前景中心裁剪/填充。
+SimpleITK 数组直接以 [Z, Y, X] 转为 tensor，与内部 ``load_nii_as_tensor``
+最终得到的轴顺序完全一致。
+
+用法（当前 data-hdbet / runs-cross-entropy）：
+
+    python external_eval.py \
+        --preprocess-config output/data-hdbet/preprocessing_config.py \
+        --checkpoint-root output/runs-cross-entropy \
+        --output-root output/runs-cross-entropy \
+        --data-root /path/to/external_cases \
+        --label 2
+
+只评估一个 fold：
+
+    python external_eval.py \
+        --preprocess-config output/data-hdbet/preprocessing_config.py \
+        --checkpoint-root output/runs-cross-entropy \
+        --output-root output/runs-cross-entropy \
+        --data-root /path/to/external_cases \
+        --label 2 --fold 1
+
+每个病例目录必须包含可识别的 T1、T2、FLAIR。该脚本只负责外部验证；
+内部 meta-fusion 的训练见 ``train_meta_fusion.py``。
+"""
 
 import argparse
 import csv
 import sys
-import os
-import tempfile
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
@@ -25,16 +39,26 @@ import torch.nn.functional as F
 import SimpleITK as sitk
 # 关闭 SimpleITK 的底层警告输出，防止控制台刷屏
 sitk.ProcessObject_SetGlobalWarningDisplay(False)
-import nibabel as nib
 
 from sklearn.metrics import accuracy_score, confusion_matrix
 
-# 导入项目中已有的组件
-from runtime_defaults import *
-from utils.resample import resample_image
-from utils.intensity import normalize_intensity
-from utils.spatial import center_crop_or_pad
-from utils.sequences import identify_sequence
+from configs.config_utils import (
+    PREPROCESS_CONFIG_FIELDS,
+    load_python_config,
+    resolve_input_artifact_dir,
+)
+from configs.global_config import (
+    ALL_SEQUENCES,
+    CLASS_NAMES,
+    K_FOLDS,
+    NUM_CLASSES,
+)
+from scripts.preprocess_data import (
+    apply_preprocessing_config,
+    preprocess_image,
+    select_sequence_files,
+    validate_preprocess_setup,
+)
 
 # 导入异构模型
 from models.FoundationModel import FoundationModel
@@ -99,13 +123,13 @@ def probs_to_row(
     return row
 
 
-def resolve_csv_path(args, data_root, target_folds, gt_label):
+def resolve_csv_path(args, data_root, target_folds, gt_label, output_root):
     if args.csv_path:
-        return Path(args.csv_path).resolve()
+        return Path(args.csv_path).expanduser().resolve()
 
     folds_name = "all" if args.fold is None else str(target_folds[0])
     filename = f"external_eval_{safe_name(data_root.name)}_label{gt_label}_folds{folds_name}.csv"
-    return (INFERENCE_OUTPUT_DIR / filename).resolve()
+    return (output_root / "inference_outputs" / filename).resolve()
 
 
 def write_diagnostics_csv(csv_path, rows):
@@ -116,43 +140,27 @@ def write_diagnostics_csv(csv_path, rows):
         writer.writerows(rows)
 
 
-def preprocess_nii_to_tensor(nii_path):
-    """
-    接收单个 NIfTI 文件的路径，进行预处理并返回模型可以直接推断的 Tensor
-    """
-    # 1. 自动读取并重采样
-    img = resample_image(nii_path, target_spacing=TARGET_SPACING, is_label=False)
+def sitk_image_to_model_tensor(img, expected_shape):
+    """把 SimpleITK [Z,Y,X] 数组转换成内部模型使用的 [1,1,D,H,W]。"""
+    data = sitk.GetArrayFromImage(img).astype(np.float32, copy=False)
+    if tuple(data.shape) != tuple(expected_shape):
+        raise ValueError(
+            f"Preprocessed array shape {tuple(data.shape)} does not match "
+            f"configured TARGET_SHAPE {tuple(expected_shape)}"
+        )
+    data = np.ascontiguousarray(data)
+    return torch.from_numpy(data).unsqueeze(0).unsqueeze(0)
+
+
+def preprocess_nii_to_tensor(nii_path, expected_shape):
+    """使用与内部数据完全相同的预处理函数处理一个外部 NIfTI。"""
+    img, _meta = preprocess_image(nii_path)
     if img is None:
         return None
-    
-    # 2. 强度归一化
-    img = normalize_intensity(img)
-    
-    # 3. 中心裁剪或填充
-    img = center_crop_or_pad(img, TARGET_SHAPE)
-    
-    # [核心修复区]
-    # SITK与Nibabel的解析坐标轴完全相反。模型训练集是通过 SITK 保存然后由 Nibabel 解析读取的。
-    # 必须通过存临时文件并由nib加载，以强制转换出绝不歪曲的严格一致阵列！
-    with tempfile.NamedTemporaryFile(suffix=".nii.gz", delete=False) as tmp:
-        tmp_path = tmp.name
-
-    try:
-        sitk.WriteImage(img, tmp_path)
-        nii = nib.load(tmp_path)
-        # 获取与训练集统一的 [X, Y, Z] 阵列
-        data = nii.get_fdata(dtype=np.float32)
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-    
-    # 转换至 Tensor 并补充 Batch(1) 和 Channel(1) 维度 -> [1, 1, D, H, W]
-    tensor = torch.from_numpy(data).unsqueeze(0).unsqueeze(0)
-    
-    return tensor
+    return sitk_image_to_model_tensor(img, expected_shape)
 
 
-def load_models_for_fold(fold_idx):
+def load_models_for_fold(fold_idx, ckpt_dirs, device):
     models = []
     print(f"\nLoading Heterogeneous Models for fold {fold_idx}...")
     for seq_idx, s_name in enumerate(ALL_SEQUENCES, start=1):
@@ -163,7 +171,7 @@ def load_models_for_fold(fold_idx):
             ModelClass = FoundationModel_ori
             target_model_name = "FoundationModel_ori"
 
-        ckpt_dir = CKPT_DIRS[seq_idx - 1] / target_model_name
+        ckpt_dir = ckpt_dirs[seq_idx - 1] / target_model_name
         ckpt_path = ckpt_dir / f"fold{fold_idx}_model_best.pth"
 
         if not ckpt_path.exists():
@@ -175,9 +183,9 @@ def load_models_for_fold(fold_idx):
         except TypeError:
             model = ModelClass(num_classes=NUM_CLASSES)
 
-        model = model.to(DEVICE)
+        model = model.to(device)
 
-        checkpoint = torch.load(ckpt_path, map_location=DEVICE)
+        checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint["model_state"])
         model.eval()
         models.append(model)
@@ -187,11 +195,42 @@ def load_models_for_fold(fold_idx):
     return models
 
 
+def resolve_runtime_device(requested_device):
+    if requested_device == "cuda" and not torch.cuda.is_available():
+        print("[Warning] CUDA requested but unavailable; falling back to CPU.")
+        return "cpu"
+    return requested_device
+
+
 def main(args):
-    data_root = Path(args.data_root).resolve()
+    preprocess_config = load_python_config(
+        args.preprocess_config,
+        PREPROCESS_CONFIG_FIELDS,
+    )
+    apply_preprocessing_config(preprocess_config)
+    validate_preprocess_setup()
+
+    data_root = Path(args.data_root).expanduser().resolve()
+    checkpoint_dir = resolve_input_artifact_dir(
+        args.checkpoint_root,
+        "checkpoints",
+    )
+    output_root = Path(args.output_root).expanduser().resolve()
+    device = resolve_runtime_device(args.device)
+    ckpt_dirs = [
+        checkpoint_dir / f"seq{seq_id}_{seq_name}"
+        for seq_id, seq_name in enumerate(ALL_SEQUENCES, start=1)
+    ]
+
     gt_label = args.label
     target_folds = [args.fold] if args.fold is not None else list(range(1, K_FOLDS + 1))
-    csv_path = resolve_csv_path(args, data_root, target_folds, gt_label)
+    csv_path = resolve_csv_path(
+        args,
+        data_root,
+        target_folds,
+        gt_label,
+        output_root,
+    )
 
     if not data_root.exists() or not data_root.is_dir():
         print(f"[Error] Data root {data_root} does not exist or is not a directory.")
@@ -204,27 +243,23 @@ def main(args):
     gt_class_name = CLASS_NAMES[gt_label]
     print(f"\n{'='*20} External Dataset Evaluation {'='*20}")
     print(f"Dataset root : {data_root}")
+    print(f"Preprocess   : {preprocess_config.__config_path__}")
+    print(f"Checkpoints  : {checkpoint_dir}")
     print(f"Ground Truth : {gt_label} ({gt_class_name})")
     print(f"Using Folds  : {target_folds}")
-    print(f"Device       : {DEVICE}")
+    print(f"Tensor shape : [1, 1, {', '.join(str(x) for x in preprocess_config.TARGET_SHAPE)}]")
+    print(f"Device       : {device}")
     print(f"CSV Output   : {csv_path}")
     print(f"{'='*69}")
 
     # ================== 1. 扫描有效数据 ==================
     cases = []
     print("\nScanning dataset for complete sequences...")
-    for item in data_root.iterdir():
+    for item in sorted(data_root.iterdir()):
         if item.is_dir():
-            files = list(item.rglob("*.nii*"))
-            seq_maps = {}
-            for f in files:
-                seq_id = identify_sequence(f)
-                if seq_id is not None:
-                    seq_maps[seq_id] = f
-            
-            # 只提取 1, 2, 3 序列齐全的病例
-            if 1 in seq_maps and 2 in seq_maps and 3 in seq_maps:
-                cases.append((item.name, seq_maps))
+            selected_files, _candidates, missing_seq_ids = select_sequence_files(item)
+            if not missing_seq_ids:
+                cases.append((item.name, selected_files))
                 
     if not cases:
         print("[Error] No valid cases with all 3 required sequences (T1, T2, FLAIR) were found.")
@@ -239,7 +274,7 @@ def main(args):
 
     print("\nStarting preprocessing and inference...")
     for fold_idx in target_folds:
-        models = load_models_for_fold(fold_idx)
+        models = load_models_for_fold(fold_idx, ckpt_dirs, device)
         pbar = tqdm(cases, desc=f"Evaluating fold {fold_idx}")
 
         for case_name, seq_maps in pbar:
@@ -247,11 +282,14 @@ def main(args):
             valid = True
 
             for seq_idx in range(1, 4):
-                tensor = preprocess_nii_to_tensor(seq_maps[seq_idx])
+                tensor = preprocess_nii_to_tensor(
+                    seq_maps[seq_idx],
+                    expected_shape=preprocess_config.TARGET_SHAPE,
+                )
                 if tensor is None:
                     valid = False
                     break
-                tensors.append(tensor.to(DEVICE))
+                tensors.append(tensor.to(device))
 
             if not valid:
                 pbar.write(f"[Warning] Failed to preprocess components for {case_name}, skipping.")
@@ -392,12 +430,30 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="External independent dataset evaluation without global_config binding.")
+    parser = argparse.ArgumentParser(
+        description="External evaluation using the exact internal preprocessing pipeline."
+    )
     parser.add_argument(
-        "--data_root", 
-        type=str, 
-        required=True, 
-        help="Path to external dataset root. Expecting subdirectories for each patient containing .nii/.nii.gz files."
+        "--preprocess-config",
+        required=True,
+        help="Path to preprocessing_config.py used to build the internal data experiment.",
+    )
+    parser.add_argument(
+        "--checkpoint-root",
+        required=True,
+        help="Training experiment root containing checkpoints, or checkpoints itself.",
+    )
+    parser.add_argument(
+        "--output-root",
+        required=True,
+        help="Output experiment root; diagnostic CSV defaults to OUTPUT_ROOT/inference_outputs.",
+    )
+    parser.add_argument(
+        "--data-root",
+        "--data_root",
+        dest="data_root",
+        required=True,
+        help="External root containing one subdirectory per case.",
     )
     parser.add_argument(
         "--label", 
@@ -414,9 +470,17 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--csv_path",
+        "--csv-path",
+        dest="csv_path",
         type=str,
         default=None,
         help="Optional path for the per-case/per-sequence probability diagnostics CSV."
+    )
+    parser.add_argument(
+        "--device",
+        choices=["cuda", "cpu"],
+        default="cuda",
+        help="Inference device (default: cuda, with automatic CPU fallback).",
     )
     args = parser.parse_args()
     

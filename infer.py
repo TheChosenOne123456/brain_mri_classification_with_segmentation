@@ -22,6 +22,7 @@ from runtime_defaults import *
 from models.FoundationModel import FoundationModel
 from models.FoundationModel_ori import FoundationModel as FoundationModel_ori
 
+from utils.dataset import load_nii_as_tensor
 from utils.train_and_test import set_seed
 
 import warnings
@@ -86,11 +87,10 @@ def load_tensor_from_nii(nii_path):
     并返回 affine 矩阵，以便后续保存为相同物理空间的图像。
     """
     nii = nib.load(str(nii_path))
-    final_np = nii.get_fdata(dtype=np.float32)
     affine = nii.affine
-    
-    # 转 Tensor [D, H, W] -> [1, 1, D, H, W]
-    tensor = torch.from_numpy(final_np).unsqueeze(0).unsqueeze(0)
+
+    # 复用训练数据加载器的 X,Y,Z -> Z,Y,X 转置，保证输入轴顺序一致。
+    tensor = load_nii_as_tensor(nii_path).unsqueeze(0)
     return tensor, affine
 
 
@@ -266,8 +266,9 @@ def main(args):
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         out_nii_path = OUTPUT_DIR / f"case_{case_id}_FLAIR_mask_pred.nii.gz"
         
-        # 将 Numpy 保存为带有正确物理信息的 NIfTI
-        pred_nii = nib.Nifti1Image(final_mask, affine_seq3)
+        # 模型内部统一使用 [Z, Y, X]；写回 NIfTI 时恢复 nibabel 的 [X, Y, Z]。
+        final_mask_nifti = np.transpose(final_mask, (2, 1, 0))
+        pred_nii = nib.Nifti1Image(final_mask_nifti, affine_seq3)
         nib.save(pred_nii, out_nii_path)
         
         print(f"\n[Artifact Output] Predicted Seq3 Mask saved to:")

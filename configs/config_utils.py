@@ -45,6 +45,20 @@ TRAIN_CONFIG_FIELDS = (
     "SEG_CLASS_WEIGHTS",
 )
 
+META_FUSION_CONFIG_FIELDS = (
+    "BASE_MODEL_NAMES",
+    "BASE_BATCH_SIZE",
+    "NUM_WORKERS",
+    "DEVICE",
+    "META_WEIGHT_STEP",
+    "META_SELECTION_METRIC",
+    "META_MIN_ACCURACY",
+    "META_ACCURACY_TOLERANCE",
+    "META_THRESHOLD_MIN",
+    "META_THRESHOLD_MAX",
+    "META_THRESHOLD_STEPS",
+)
+
 
 def load_python_config(config_path, required_names=()):
     """从任意路径加载 Python 配置，并检查必需字段。"""
