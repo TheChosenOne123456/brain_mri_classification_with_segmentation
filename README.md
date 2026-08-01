@@ -18,6 +18,9 @@
 │   ├── cnn3d.py
 │   ├── FoundationModel_ori.py
 │   ├── FoundationModel.py
+│   ├── FoundationModelHierarchical.py
+│   ├── FoundationModelLesionAwareHierarchical.py
+│   ├── model_factory.py
 │   └── ResNet.py
 ├── scripts
 │   ├── preprocess_data.py
@@ -68,15 +71,17 @@
 │   │   ├── dataset_config.py
 │   │   ├── data
 │   │   └── datasets
-│   └── runs-cross-entropy
+│   ├── runs-cross-entropy
 │       ├── train_config.py
 │       ├── checkpoints
 │       └── output_texts
+│   └── runs-hierarchical
+│       └── train_config.py
 ```
 
 项目主要子文件和子文件夹意义如下：
 1. configs：`global_config.py` 只保存类别、序列、随机种子、K-Fold 和原始数据路径等跨阶段设置；`config_utils.py` 负责加载实验目录中的阶段配置并解析标准产物目录
-2. models：模型的实现，其中`FoundationModel_ori.py`用于seq1/seq2纯分类模型，`FoundationModel.py`用于seq3带分割头的多任务模型
+2. models：模型的实现，其中`FoundationModel_ori.py`用于seq1/seq2纯分类模型，`FoundationModel.py`用于seq3带分割头的多任务模型；`FoundationModelHierarchical.py`是主三分类头+异常子类头+可选分割头的层级实验模型，`FoundationModelLesionAwareHierarchical.py`是使用分割 soft attention 汇聚病灶空间特征的 FLAIR 专用层级模型，`model_factory.py`统一模型注册、能力判断与前向输出
 3. utils：一些工具的实现
 4. scripts：必要的脚本实现，包含“数据预处理”“mask预处理”和“训练集、验证集和测试集的生成”
 5. train_kfold.py：训练脚本，配合k折交叉验证使用
@@ -272,6 +277,20 @@ seq3 ──▶ FoundationModel(双头) ──┬──▶ prob3 ──┘
                                   └──▶ seg(分割结果)
 ```
 
+#### 层级分类实验
+
+`FoundationModelHierarchical` 使用一个共享 r3d_18 backbone，同时训练：
+
+1. 主头：`normal / inflammation / metastasis` 三分类，保持正常类判别能力。
+2. 子类头：`inflammation / metastasis` 二分类，只在真实异常样本上计算损失，直接强化当前最主要的炎症/转移混淆。
+3. 可选分割头：相同模型代码分别训练三个序列，但只有 `--seq 3` 创建和训练分割头；seq1/seq2 不创建分割参数。
+
+层级最终判定先由三个主头的平均概率判断 normal/abnormal；若判为 abnormal，再由三个子类头的平均概率决定 inflammation/metastasis。子类头不会单独把主头判为 normal 的病例强行改成转移，因此比全局降低转移阈值更有利于保持整体准确率。
+
+所有模型必须显式声明 `has_classification_head`、`has_subtype_head`、`has_segmentation_head`。训练和评估通过 `models/model_factory.py` 查询能力，不再使用 `model_name == "FoundationModel"` 推断输出。旧模型的默认 `forward(x)` 和 checkpoint state_dict 键保持兼容。
+
+多卡运行时，结构化前向的控制标志由 `forward_model` 统一以位置参数传递。不要把这些布尔标志改成传给 `DataParallel` 的关键字参数：最后一个 batch 小于 GPU 数量时，这会产生没有影像输入的空 replica，并触发 `forward() missing ... 'x'`。该问题不能用 `drop_last=True` 回避，否则会丢训练样本。
+
 #### 训练过程
 训练过程引入patience机制，根据模型在验证集上的表现，决定是否早停。为了避免训练起始阶段收敛不稳定，从而异常早停，我们引入了最小训练轮数，在保护期内不触发早停。
 
@@ -295,6 +314,26 @@ python train_kfold.py \
     --seq 3 --model FoundationModel --fold 1
 ...
 ```
+
+层级模型使用现有 `output/data-hdbet`，不需要重新预处理或重建数据集。首轮配置为
+`SUBTYPE_ALPHA=0.5`、`SUBTYPE_CLASS_WEIGHT_POWER=0.5`、
+`HIERARCHICAL_MIN_VAL_ACCURACY=0.85`。这里的 0.85 是单序列验证准确率下限；旧基准的
+单序列验证准确率约为 0.87～0.90，最终三序列融合仍以 0.90+ 为目标：
+
+```bash
+# 把 --seq 和 --fold 分别替换为 1~3、1~5，合计训练 15 个模型
+python train_kfold.py \
+    --config output/runs-hierarchical/train_config.py \
+    --data-root output/data-hdbet \
+    --output-root output/runs-hierarchical \
+    --seq 1 \
+    --model FoundationModelHierarchical \
+    --fold 1
+```
+
+层级模型优先在验证集层级准确率达到 `HIERARCHICAL_MIN_VAL_ACCURACY` 的 epoch 中，以
+`val_hierarchical_f1` 保存最佳 checkpoint；若整折始终未达下限，才回退到层级 F1
+最高的 epoch。测试集不参与训练、早停、阈值或 checkpoint 选择。
 
 `CLASSIFICATION_LOSS` 可设为 `weighted_cross_entropy`（当前默认逻辑）、`cross_entropy` 或 `class_balanced_focal`。迁移后的历史 `.pt` 仍保存了原 `version1/data/...` 路径，但加载器会根据 `--data-root output/data-hdbet` 自动重定位到新的 `data/`。
 
@@ -334,6 +373,29 @@ python eval.py \
     --config output/runs-cross-entropy/train_config.py \
     --data-root output/data-hdbet \
     --checkpoint-root output/runs-cross-entropy
+
+# 层级模型单序列评估：同时报告主头、层级输出和异常子类头指标
+python eval_kfold.py \
+    --config output/runs-hierarchical/train_config.py \
+    --data-root output/data-hdbet \
+    --checkpoint-root output/runs-hierarchical \
+    --seq 3 \
+    --model FoundationModelHierarchical
+
+# 三序列层级融合评估
+python eval.py \
+    --config output/runs-hierarchical/train_config.py \
+    --data-root output/data-hdbet \
+    --checkpoint-root output/runs-hierarchical \
+    --model-set hierarchical
+
+# 临床层级融合推理
+python infer.py \
+    --id 0001 \
+    --data-root output/data-hdbet \
+    --checkpoint-root output/runs-hierarchical \
+    --output-root output/runs-hierarchical \
+    --model-set hierarchical
 
 # 训练受约束的 cross-fitted OOF 晚期融合器。
 # 每个目标 fold 使用另外四折的 OOF-test 概率选择三个模态权重和转移阈值；

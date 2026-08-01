@@ -28,11 +28,11 @@ from configs.global_config import (
     SEED,
 )
 
-from models.cnn3d import Simple3DCNN
-from models.ResNet import ResNet10
-from models.FoundationModel import FoundationModel
-# [新增] 引入旧版原始模型
-from models.FoundationModel_ori import FoundationModel as FoundationModel_ori
+from models.model_factory import (
+    create_model,
+    forward_model,
+    model_capabilities,
+)
 from utils.train_and_test import set_seed, load_pt_dataset
 
 import warnings
@@ -84,12 +84,23 @@ def evaluate_vote_single_fold(
     batch_size,
     num_workers,
     device,
+    model_set,
 ):
     """
     使用三个模型进行软投票的评估函数
     """
     print(f"\n{'='*20} Evaluating Fold {fold_idx} {'='*20}")
-    print(f"Mode: Late Fusion (Soft Voting) | Model: Heterogeneous Ensemble")
+    if model_set == "hierarchical":
+        model_names = ["FoundationModelHierarchical"] * len(ALL_SEQUENCES)
+        mode_name = "Hierarchical Late Fusion"
+    else:
+        model_names = [
+            "FoundationModel_ori",
+            "FoundationModel_ori",
+            "FoundationModel",
+        ]
+        mode_name = "Baseline Heterogeneous Soft Voting"
+    print(f"Mode: {mode_name}")
 
     # ---------- 1. 加载数据 ----------
     test_sets_list = []
@@ -119,13 +130,7 @@ def evaluate_vote_single_fold(
     # ---------- 2. 初始化并加载 3 个模型 ----------
     models = []
     for seq_idx, s_name in enumerate(ALL_SEQUENCES):
-        # 根据通道决定使用旧版(单任务)还是新版(双头)
-        if s_name == "FLAIR":
-            target_model_name = "FoundationModel"
-            ModelClass = FoundationModel
-        else:
-            target_model_name = "FoundationModel_ori"
-            ModelClass = FoundationModel_ori
+        target_model_name = model_names[seq_idx]
 
         ckpt_dir = ckpt_dirs[seq_idx] / target_model_name
         ckpt_path = ckpt_dir / f"fold{fold_idx}_model_best.pth"
@@ -134,12 +139,12 @@ def evaluate_vote_single_fold(
             print(f"\n[Warning] Model checkpoint missing for {s_name} at {ckpt_path}. Skipping fold {fold_idx}.")
             return None
         
-        # 实例化单通道模型
-        try:
-            model = ModelClass(num_classes=NUM_CLASSES, in_channels=1)
-        except TypeError:
-            model = ModelClass(num_classes=NUM_CLASSES)
-            
+        model = create_model(
+            target_model_name,
+            num_classes=NUM_CLASSES,
+            in_channels=1,
+            sequence_id=seq_idx + 1,
+        )
         model = model.to(device)
         checkpoint = torch.load(ckpt_path, map_location=device)
         model.load_state_dict(checkpoint["model_state"])
@@ -150,10 +155,11 @@ def evaluate_vote_single_fold(
         model.eval()
         models.append(model)
         
-    print("  -> Successfully loaded 3 heterogeneous models (T1_ori, T2_ori, FLAIR_mt).")
+    print(f"  -> Successfully loaded: {', '.join(model_names)}")
 
     # ---------- 3. 测试 (软投票机制) ----------
     all_preds = []
+    all_main_preds = []
     all_labels = []
     misclassified_cases = []
 
@@ -164,27 +170,46 @@ def evaluate_vote_single_fold(
             
             # xs 包含 3 个 batch tensor (T1, T2, FLAIR)
             probs = []
+            subtype_probs = []
             for i, x in enumerate(xs):
                 x = x.to(device)
-                
-                logits = models[i](x)
+                capabilities = model_capabilities(models[i])
+                outputs = forward_model(
+                    models[i],
+                    x,
+                    return_subtype=capabilities["subtype"],
+                )
+                logits = outputs["classification"]
                 
                 # 将 logits 转换为概率分布
                 prob = F.softmax(logits, dim=1)
                 probs.append(prob)
+                if capabilities["subtype"]:
+                    subtype_probs.append(
+                        F.softmax(outputs["subtype"], dim=1)
+                    )
             
             # --- 核心：平均概率 (Soft Voting) ---
             # 也可以在这里改成加权平均，例如:
             # avg_prob = 0.5 * probs[0] + 0.25 * probs[1] + 0.25 * probs[2]
             avg_prob = (probs[0] + probs[1] + probs[2]) / 3.0
             
-            # 最终预测结果
-            preds = avg_prob.argmax(dim=1)
+            main_preds = avg_prob.argmax(dim=1)
+            if model_set == "hierarchical":
+                avg_subtype_prob = torch.stack(subtype_probs, dim=0).mean(dim=0)
+                preds = main_preds.clone()
+                abnormal = main_preds != 0
+                subtype_preds = avg_subtype_prob.argmax(dim=1) + 1
+                preds[abnormal] = subtype_preds[abnormal]
+            else:
+                preds = main_preds
 
             preds_cpu = preds.cpu().numpy()
+            main_preds_cpu = main_preds.cpu().numpy()
             labels_cpu = y.cpu().numpy()
 
             all_preds.extend(preds_cpu)
+            all_main_preds.extend(main_preds_cpu)
             all_labels.extend(labels_cpu)
 
             # 收集误判 case
@@ -202,15 +227,26 @@ def evaluate_vote_single_fold(
     recall = recall_score(all_labels, all_preds, average='macro', zero_division=0)
     f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
     cm = confusion_matrix(all_labels, all_preds)
+    if model_set == "hierarchical":
+        main_acc = accuracy_score(all_labels, all_main_preds)
+        main_f1 = f1_score(
+            all_labels,
+            all_main_preds,
+            average="macro",
+            zero_division=0,
+        )
 
     # ---------- 5. 打印结果 ----------
     print("\n===== Test Results =====")
-    print(f"Sequence      : ALL (Soft Voting) (Fold {fold_idx})")
+    print(f"Sequence      : ALL ({mode_name}) (Fold {fold_idx})")
     print(f"Test samples  : {len(test_set)}")
     print(f"Accuracy      : {acc:.4f}")
     print(f"Precision     : {precision:.4f}")
     print(f"Recall        : {recall:.4f}")
     print(f"F1-score      : {f1:.4f}")
+    if model_set == "hierarchical":
+        print(f"Main-head Acc : {main_acc:.4f}")
+        print(f"Main-head F1  : {main_f1:.4f}")
 
     print("\nConfusion Matrix:")
     print(cm)
@@ -243,7 +279,9 @@ def evaluate_vote_single_fold(
         "acc": acc,
         "precision": precision,
         "recall": recall,
-        "f1": f1
+        "f1": f1,
+        "main_acc": main_acc if model_set == "hierarchical" else acc,
+        "main_f1": main_f1 if model_set == "hierarchical" else f1,
     }
 
 
@@ -264,7 +302,7 @@ def main(args):
 
     set_seed(SEED)
 
-    print(f"\n>>> Starting K-Fold Evaluation for: Late Fusion Soft Voting (Heterogeneous) <<<")
+    print(f"\n>>> Starting K-Fold Evaluation for: {args.model_set} fusion <<<")
     print(f"Evaluation config: {config.__config_path__}")
     print(f"Dataset input   : {dataset_root}")
     print(f"Checkpoint input: {ckpt_root}")
@@ -287,6 +325,7 @@ def main(args):
             batch_size=config.BATCH_SIZE,
             num_workers=config.NUM_WORKERS,
             device=config.DEVICE,
+            model_set=args.model_set,
         )
         if res:
             metrics_history.append(res)
@@ -309,8 +348,12 @@ def main(args):
         avg_rec = np.mean([r['recall'] for r in metrics_history])
         std_rec = np.std([r['recall'] for r in metrics_history])
 
-        print(f"Method        : Late Fusion Soft Voting (Heterogeneous Ensemble)")
-        print(f"Models        : Seq1/Seq2=FoundationModel_ori, Seq3=FoundationModel")
+        if args.model_set == "hierarchical":
+            print("Method        : Hierarchical Late Fusion")
+            print("Models        : All sequences=FoundationModelHierarchical")
+        else:
+            print("Method        : Late Fusion Soft Voting (Heterogeneous Ensemble)")
+            print("Models        : Seq1/Seq2=FoundationModel_ori, Seq3=FoundationModel")
         print("-" * 40)
         print(f"{'Metric':<15} | {'Mean':<10} | {'Std':<10}")
         print("-" * 40)
@@ -318,6 +361,11 @@ def main(args):
         print(f"{'Precision':<15} | {avg_prec:.4f}     | ±{std_prec:.4f}")
         print(f"{'Recall':<15} | {avg_rec:.4f}     | ±{std_rec:.4f}")
         print(f"{'F1-Score':<15} | {avg_f1:.4f}     | ±{std_f1:.4f}")
+        if args.model_set == "hierarchical":
+            avg_main_acc = np.mean([r["main_acc"] for r in metrics_history])
+            avg_main_f1 = np.mean([r["main_f1"] for r in metrics_history])
+            print(f"{'Main-head Acc':<15} | {avg_main_acc:.4f}     |")
+            print(f"{'Main-head F1':<15} | {avg_main_f1:.4f}     |")
         print("-" * 40)
     elif len(metrics_history) == 0:
         print("\n[Error] No folds were successfully evaluated.")
@@ -347,6 +395,15 @@ if __name__ == "__main__":
         default=None,
         choices=range(1, K_FOLDS + 1),
         help=f"Specific fold to evaluate (1~{K_FOLDS}). If not set, run all folds.",
+    )
+    parser.add_argument(
+        "--model-set",
+        choices=("baseline", "hierarchical"),
+        default="baseline",
+        help=(
+            "baseline keeps the existing heterogeneous ensemble; hierarchical "
+            "uses FoundationModelHierarchical for all three sequences"
+        ),
     )
     args = parser.parse_args()
 

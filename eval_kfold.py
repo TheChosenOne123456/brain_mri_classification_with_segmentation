@@ -5,6 +5,24 @@ K-Fold 评估脚本：
 - 如果不指定 --fold，则自动评估所有 fold 并计算平均指标。
 - 支持单通道(指定--seq) 与 多通道(不指定--seq) 模型评估。
 [适配新服务器：8x RTX 3080]
+
+层级模型 Fold 1 单序列评估示例（只评估已经训练完成的 checkpoint）：
+python eval_kfold.py \
+  --config output/runs-hierarchical/train_config.py \
+  --data-root output/data-hdbet \
+  --checkpoint-root output/runs-hierarchical \
+  --seq 1 --model FoundationModelHierarchical --fold 1
+
+训练仍占用全部 GPU 时，可在另一终端限制评估只使用物理 GPU 7 和 batch 1：
+CUDA_VISIBLE_DEVICES=7 python eval_kfold.py \
+  --config output/runs-hierarchical/train_config.py \
+  --data-root output/data-hdbet \
+  --checkpoint-root output/runs-hierarchical \
+  --seq 1 --model FoundationModelHierarchical --fold 1 \
+  --batch-size 1 --num-workers 4
+
+将 --seq 1 替换为 2 或 3，可分别评估 T2 或 FLAIR。省略 --fold 时会
+评估该序列所有已存在的 fold；缺少 checkpoint 的 fold 会被跳过。
 '''
 
 import argparse
@@ -28,10 +46,13 @@ from configs.global_config import (
 )
 from runtime_defaults import DATA_EXPERIMENT_ROOT, TRAIN_EXPERIMENT_ROOT
 
-from models.cnn3d import Simple3DCNN
-from models.ResNet import ResNet10, ResNet18
-from models.FoundationModel import FoundationModel
-from models.FoundationModel_ori import FoundationModel as FoundationModel_ori
+from models.model_factory import (
+    MODEL_CHOICES,
+    create_model,
+    forward_model,
+    hierarchical_predictions,
+    model_capabilities,
+)
 from utils.train_and_test import set_seed, load_pt_dataset
 
 import warnings
@@ -126,7 +147,42 @@ class MultiChannelDataset(Dataset):
             return multi_x, final_y, final_case_id
 
 
-def evaluate_single_fold(args_seq, model_name, fold_idx, ModelClass):
+def calculate_classification_metrics(labels, predictions):
+    return {
+        "acc": accuracy_score(labels, predictions),
+        "precision": precision_score(
+            labels,
+            predictions,
+            average="macro",
+            zero_division=0,
+        ),
+        "recall": recall_score(
+            labels,
+            predictions,
+            average="macro",
+            zero_division=0,
+        ),
+        "f1": f1_score(
+            labels,
+            predictions,
+            average="macro",
+            zero_division=0,
+        ),
+        "cm": confusion_matrix(labels, predictions),
+    }
+
+
+def print_classification_metrics(title, metrics):
+    print(f"\n===== {title} =====")
+    print(f"Accuracy      : {metrics['acc']:.4f}")
+    print(f"Precision     : {metrics['precision']:.4f}")
+    print(f"Recall        : {metrics['recall']:.4f}")
+    print(f"F1-score      : {metrics['f1']:.4f}")
+    print("Confusion Matrix:")
+    print(metrics["cm"])
+
+
+def evaluate_single_fold(args_seq, model_name, fold_idx):
     """
     评估单个 Fold 的核心函数
     """
@@ -196,12 +252,14 @@ def evaluate_single_fold(args_seq, model_name, fold_idx, ModelClass):
     )
 
     # ---------- 初始化并加载模型 ----------
-    try:
-        model = ModelClass(num_classes=NUM_CLASSES, in_channels=in_channels)
-    except TypeError:
-        print(f"[Warning] {model_name} does not accept 'in_channels'. Using default.")
-        model = ModelClass(num_classes=NUM_CLASSES)
-        
+    model = create_model(
+        model_name,
+        num_classes=NUM_CLASSES,
+        in_channels=in_channels,
+        sequence_id=args_seq,
+    )
+    capabilities = model_capabilities(model)
+    print(f"Model Capabilities: {capabilities}")
     model = model.to(DEVICE)
     
     # 训练时我们保存的是 model.module (如果用了多卡)，所以这里直接加载字典是对应的
@@ -209,7 +267,7 @@ def evaluate_single_fold(args_seq, model_name, fold_idx, ModelClass):
     model.load_state_dict(checkpoint["model_state"])
 
     # [修改点] 加载完权重后再启用 DataParallel 进行推理加速
-    if torch.cuda.device_count() > 1:
+    if str(DEVICE).startswith("cuda") and torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs for evaluation!")
         model = nn.DataParallel(model)
 
@@ -218,7 +276,10 @@ def evaluate_single_fold(args_seq, model_name, fold_idx, ModelClass):
 
     # ---------- 测试 ----------
     all_preds = []
+    all_main_preds = []
     all_labels = []
+    all_subtype_preds = []
+    all_subtype_labels = []
     total_loss = 0.0
     
     valid_seg_dices = []
@@ -236,17 +297,30 @@ def evaluate_single_fold(args_seq, model_name, fold_idx, ModelClass):
                 
             x, y = x.to(DEVICE), y.to(DEVICE)
             
-            # 判断是否能展开分割头（仅 FoundationModel 支持且需要开启 return_seg）
-            if model_name == "FoundationModel" and has_seg_data:
-                logits, seg_logits = model(x, True)
-            else:
-                logits = model(x)
-                seg_logits = None
+            outputs = forward_model(
+                model,
+                x,
+                return_subtype=capabilities["subtype"],
+                return_seg=capabilities["segmentation"] and has_seg_data,
+            )
+            logits = outputs["classification"]
+            seg_logits = outputs.get("segmentation")
                 
             loss = criterion(logits, y)
 
             total_loss += loss.item()
-            preds = logits.argmax(dim=1)
+            main_preds = logits.argmax(dim=1)
+            if capabilities["subtype"]:
+                subtype_logits = outputs["subtype"]
+                preds = hierarchical_predictions(logits, subtype_logits)
+                abnormal = y > 0
+                if abnormal.any():
+                    all_subtype_preds.extend(
+                        subtype_logits[abnormal].argmax(dim=1).cpu().numpy()
+                    )
+                    all_subtype_labels.extend((y[abnormal] - 1).cpu().numpy())
+            else:
+                preds = main_preds
             
             # --- 收集分割 Dice (若存在) ---
             if seg_logits is not None and has_seg_data:
@@ -266,9 +340,11 @@ def evaluate_single_fold(args_seq, model_name, fold_idx, ModelClass):
                         valid_seg_dices.append(batch_dices[i].item())
 
             preds_cpu = preds.cpu().numpy()
+            main_preds_cpu = main_preds.cpu().numpy()
             labels_cpu = y.cpu().numpy()
 
             all_preds.extend(preds_cpu)
+            all_main_preds.extend(main_preds_cpu)
             all_labels.extend(labels_cpu)
 
             # --------- 收集误判 case ---------
@@ -284,26 +360,36 @@ def evaluate_single_fold(args_seq, model_name, fold_idx, ModelClass):
     avg_dice = np.mean(valid_seg_dices) if len(valid_seg_dices) > 0 else 0.0
 
     # ---------- 计算指标 ----------
-    acc = accuracy_score(all_labels, all_preds)
-    precision = precision_score(all_labels, all_preds, average='macro', zero_division=0)
-    recall = recall_score(all_labels, all_preds, average='macro', zero_division=0)
-    f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
-    cm = confusion_matrix(all_labels, all_preds)
+    metrics = calculate_classification_metrics(all_labels, all_preds)
+    main_metrics = calculate_classification_metrics(all_labels, all_main_preds)
 
     # ---------- 打印结果 ----------
     print("\n===== Test Results =====")
     print(f"Sequence      : {seq_name} (Fold {fold_idx})")
     print(f"Test samples  : {len(test_set)}")
     print(f"Test loss     : {avg_loss:.4f}")
-    print(f"Accuracy      : {acc:.4f}")
-    print(f"Precision     : {precision:.4f}")
-    print(f"Recall        : {recall:.4f}")
-    print(f"F1-score      : {f1:.4f}")
+    if capabilities["subtype"]:
+        print_classification_metrics("Main Head Results", main_metrics)
+        print_classification_metrics("Hierarchical Results", metrics)
+        subtype_metrics = calculate_classification_metrics(
+            all_subtype_labels,
+            all_subtype_preds,
+        )
+        print_classification_metrics(
+            "Subtype Head on Ground-Truth Abnormal Cases",
+            subtype_metrics,
+        )
+    else:
+        print(f"Accuracy      : {metrics['acc']:.4f}")
+        print(f"Precision     : {metrics['precision']:.4f}")
+        print(f"Recall        : {metrics['recall']:.4f}")
+        print(f"F1-score      : {metrics['f1']:.4f}")
     if len(valid_seg_dices) > 0:
         print(f"Seg Dice      : {avg_dice:.4f}  (Evaluated on {len(valid_seg_dices)} samples)")
 
-    print("\nConfusion Matrix:")
-    print(cm)
+    if not capabilities["subtype"]:
+        print("\nConfusion Matrix:")
+        print(metrics["cm"])
 
     print("\nClassification Report:")
     print(
@@ -330,10 +416,13 @@ def evaluate_single_fold(args_seq, model_name, fold_idx, ModelClass):
         print("None")
 
     return {
-        "acc": acc,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
+        "acc": metrics["acc"],
+        "precision": metrics["precision"],
+        "recall": metrics["recall"],
+        "f1": metrics["f1"],
+        "main_acc": main_metrics["acc"],
+        "main_f1": main_metrics["f1"],
+        "has_subtype": capabilities["subtype"],
         "loss": avg_loss,
         "dice": avg_dice
     }
@@ -344,6 +433,12 @@ def main(args):
     config = load_python_config(args.config, TRAIN_CONFIG_FIELDS)
     for name in TRAIN_CONFIG_FIELDS:
         globals()[name] = getattr(config, name)
+    if args.device is not None:
+        globals()["DEVICE"] = args.device
+    if args.batch_size is not None:
+        globals()["BATCH_SIZE"] = args.batch_size
+    if args.num_workers is not None:
+        globals()["NUM_WORKERS"] = args.num_workers
 
     dataset_root = resolve_input_artifact_dir(args.data_root, "datasets")
     ckpt_root = resolve_input_artifact_dir(args.checkpoint_root, "checkpoints")
@@ -360,18 +455,6 @@ def main(args):
     set_seed(SEED)
 
     model_name = args.model
-    if model_name == "cnn3d":
-        ModelClass = Simple3DCNN
-    elif model_name == "ResNet":
-        ModelClass = ResNet10
-    elif model_name == "ResNet18":
-        ModelClass = ResNet18
-    elif model_name == "FoundationModel":
-        ModelClass = FoundationModel
-    elif model_name == "FoundationModel_ori":
-        ModelClass = FoundationModel_ori
-    else:
-        raise ValueError(f"Unknown model: {model_name}")
 
     if args.seq is not None:
         seq_name = ALL_SEQUENCES[args.seq - 1]
@@ -395,7 +478,7 @@ def main(args):
 
     # ---------- 循环评估 ----------
     for k in folds_to_run:
-        res = evaluate_single_fold(args.seq, model_name, k, ModelClass)
+        res = evaluate_single_fold(args.seq, model_name, k)
         if res:
             metrics_history.append(res)
     
@@ -430,6 +513,11 @@ def main(args):
         print(f"{'Precision':<15} | {avg_prec:.4f}     | ±{std_prec:.4f}")
         print(f"{'Recall':<15} | {avg_rec:.4f}     | ±{std_rec:.4f}")
         print(f"{'F1-Score':<15} | {avg_f1:.4f}     | ±{std_f1:.4f}")
+        if any(r["has_subtype"] for r in metrics_history):
+            avg_main_acc = np.mean([r["main_acc"] for r in metrics_history])
+            avg_main_f1 = np.mean([r["main_f1"] for r in metrics_history])
+            print(f"{'Main-head Acc':<15} | {avg_main_acc:.4f}     |")
+            print(f"{'Main-head F1':<15} | {avg_main_f1:.4f}     |")
         if has_dice:
             print(f"{'Seg Dice':<15} | {avg_dice:.4f}     | ±{std_dice:.4f}")
         print("-" * 40)
@@ -461,6 +549,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--seq",
         type=int,
+        choices=range(1, len(ALL_SEQUENCES) + 1),
         required=False,
         default=None,
         help="Which MRI sequence to evaluate (1~3). Leave empty for Multi-Channel.",
@@ -469,7 +558,7 @@ if __name__ == "__main__":
         "--model",
         type=str,
         required=True,
-        choices=["cnn3d", "ResNet", "ResNet18", "FoundationModel", "FoundationModel_ori"],
+        choices=MODEL_CHOICES,
         help="Which model architecture to use",
     )
     parser.add_argument(
@@ -478,6 +567,23 @@ if __name__ == "__main__":
         default=None,
         choices=range(1, K_FOLDS + 1),
         help=f"Specific fold to evaluate (1~{K_FOLDS}). If not set, run all folds.",
+    )
+    parser.add_argument(
+        "--device",
+        default=None,
+        help="Optional runtime override, e.g. cuda or cpu.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Optional evaluation batch-size override.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help="Optional DataLoader worker-count override.",
     )
     args = parser.parse_args()
 

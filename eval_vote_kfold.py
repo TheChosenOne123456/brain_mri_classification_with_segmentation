@@ -16,9 +16,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from runtime_defaults import *
 
-from models.cnn3d import Simple3DCNN
-from models.ResNet import ResNet10
-from models.FoundationModel import FoundationModel
+from models.model_factory import create_model, forward_model
 from utils.train_and_test import set_seed, load_pt_dataset
 
 import warnings
@@ -62,7 +60,10 @@ class MultiSequenceDataset(Dataset):
 # ================================================
 
 
-def evaluate_vote_single_fold(model_name, fold_idx, ModelClass):
+SUPPORTED_VOTE_MODELS = ("cnn3d", "ResNet", "FoundationModel")
+
+
+def evaluate_vote_single_fold(model_name, fold_idx):
     """
     使用三个模型进行软投票的评估函数
     """
@@ -96,12 +97,12 @@ def evaluate_vote_single_fold(model_name, fold_idx, ModelClass):
             print(f"\n[Warning] Model checkpoint missing for {s_name} at {ckpt_path}. Skipping fold {fold_idx}.")
             return None
         
-        # 实例化单通道模型
-        try:
-            model = ModelClass(num_classes=NUM_CLASSES, in_channels=1)
-        except TypeError:
-            model = ModelClass(num_classes=NUM_CLASSES)
-            
+        model = create_model(
+            model_name,
+            num_classes=NUM_CLASSES,
+            in_channels=1,
+            sequence_id=seq_idx + 1,
+        )
         model = model.to(DEVICE)
         checkpoint = torch.load(ckpt_path, map_location=DEVICE)
         model.load_state_dict(checkpoint["model_state"])
@@ -128,7 +129,10 @@ def evaluate_vote_single_fold(model_name, fold_idx, ModelClass):
             probs = []
             for i, x in enumerate(xs):
                 x = x.to(DEVICE)
-                logits = models[i](x)
+                logits = forward_model(
+                    models[i],
+                    x,
+                )["classification"]
                 # 将 logits 转换为概率分布
                 prob = F.softmax(logits, dim=1)
                 probs.append(prob)
@@ -212,15 +216,6 @@ def main(args):
     set_seed(SEED)
 
     model_name = args.model
-    if model_name == "cnn3d":
-        ModelClass = Simple3DCNN
-    elif model_name == "ResNet":
-        ModelClass = ResNet10
-    elif model_name == "FoundationModel":
-        ModelClass = FoundationModel
-    else:
-        raise ValueError(f"Unknown model: {model_name}")
-
     print(f"\n>>> Starting K-Fold Evaluation for: Late Fusion Soft Voting <<<")
 
     if args.fold is not None:
@@ -233,7 +228,7 @@ def main(args):
     metrics_history = []
 
     for k in folds_to_run:
-        res = evaluate_vote_single_fold(model_name, k, ModelClass)
+        res = evaluate_vote_single_fold(model_name, k)
         if res:
             metrics_history.append(res)
     
@@ -275,7 +270,7 @@ if __name__ == "__main__":
         "--model",
         type=str,
         required=True,
-        choices=["cnn3d", "ResNet", "FoundationModel"],
+        choices=SUPPORTED_VOTE_MODELS,
         help="Which model architecture to use",
     )
     parser.add_argument(

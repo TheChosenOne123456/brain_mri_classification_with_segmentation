@@ -17,7 +17,10 @@ mask 预处理只读取 JSON metadata，不重新运行 HD-BET：
         --data-root dataxxx
 
     # 默认会清理旧的 *_mask.nii.gz 和 mask_index.json 后重建；
-    # 如果只想增量追加，可加 --no-clear_existing_masks
+    # 如果只想增量追加，可加 --no-clear-existing-masks。增量模式会：
+    # - 保留并跳过已有 mask 文件；
+    # - 载入并合并已有 mask_index.json；
+    # - 只处理尚不存在的 case/sequence mask。
     python -m scripts.preprocess_mask ... --no-clear-existing-masks
 """
 
@@ -61,6 +64,12 @@ def clear_existing_masks(out_root: Path):
         mask_index_path.unlink()
 
     return removed
+
+
+def add_mask_index_entry(mask_index, case_id_str, seq_id):
+    sequences = mask_index.setdefault(case_id_str, [])
+    normalized_sequences = sorted({int(seq) for seq in sequences} | {int(seq_id)})
+    mask_index[case_id_str] = normalized_sequences
 
 
 def get_preprocess_meta_path(image_path: Path):
@@ -158,11 +167,17 @@ def main(args):
         print(f"已清理旧 mask 文件: {removed}")
 
     case_index = load_index(index_path)
-    mask_index = {}
+    mask_index_path = out_root / MASK_INDEX_FILE_NAME
+    mask_index = (
+        {}
+        if args.clear_existing_masks
+        else load_index(mask_index_path)
+    )
     cases = collect_cases(mask_roots)
     print(f"在源路径共扫描到 {len(cases)} 个样本文件夹。")
 
     processed_count = 0
+    existing_count = 0
     skipped_count = 0
 
     for case_dir in tqdm(cases, desc="Processing masks"):
@@ -197,6 +212,11 @@ def main(args):
                 base_img_path.parent / f"case_{case_id_str}_{seq_id}_mask.nii.gz"
             )
 
+            if not args.clear_existing_masks and out_mask_path.exists():
+                add_mask_index_entry(mask_index, case_id_str, seq_id)
+                existing_count += 1
+                continue
+
             try:
                 meta, meta_path = load_preprocess_meta(base_img_path)
                 if meta is None:
@@ -229,11 +249,7 @@ def main(args):
 
                 save_image(fixed_mask, out_mask_path)
 
-                if case_id_str not in mask_index:
-                    mask_index[case_id_str] = []
-                if seq_id not in mask_index[case_id_str]:
-                    mask_index[case_id_str].append(seq_id)
-                    mask_index[case_id_str].sort()
+                add_mask_index_entry(mask_index, case_id_str, seq_id)
 
                 processed_count += 1
 
@@ -242,11 +258,11 @@ def main(args):
                 skipped_count += 1
                 continue
 
-    mask_index_path = out_root / MASK_INDEX_FILE_NAME
     save_index(mask_index, mask_index_path)
 
     print("\n=== Mask 预处理完成 ===")
-    print(f"成功保存 mask 文件数: {processed_count}")
+    print(f"新增保存 mask 文件数: {processed_count}")
+    print(f"保留并跳过已有 mask 文件数: {existing_count}")
     print(f"跳过/失败数量: {skipped_count}")
     print(f"共录入了 {len(mask_index)} 个主样本（Case）的 Mask。")
     print(f"Mask 序列索引保存至 {mask_index_path}")
@@ -274,7 +290,10 @@ if __name__ == "__main__":
         "--clear-existing-masks",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="先清理旧的 *_mask.nii.gz 和 mask_index.json，再重建",
+        help=(
+            "默认清理旧 mask 后重建；--no-clear-existing-masks 会保留已有 "
+            "mask、合并旧 mask_index，并只补充缺失项"
+        ),
     )
     args = parser.parse_args()
 

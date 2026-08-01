@@ -55,6 +55,11 @@ class BasicBlock(nn.Module):
 
 
 class ResNet(nn.Module):
+    has_classification_head = True
+    has_subtype_head = False
+    has_segmentation_head = False
+    uses_capability_interface = False
+
     def __init__(self, block, num_blocks, num_classes=2, in_channels=1):
         super(ResNet, self).__init__()
         self.in_planes = 64

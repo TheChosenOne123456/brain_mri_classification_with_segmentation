@@ -17,6 +17,11 @@ class FoundationModel(nn.Module):
     - head: 分类头（可替换）
     - aux_heads: 预留多任务/蒸馏/对比学习头
     """
+    has_classification_head = True
+    has_subtype_head = False
+    has_segmentation_head = False
+    uses_capability_interface = True
+
     def __init__(
         self,
         num_classes: int = 3,
@@ -109,7 +114,20 @@ class FoundationModel(nn.Module):
         feat = self.neck(feat)
         return feat
 
-    def forward(self, x):
+    def forward(
+        self,
+        x,
+        return_seg=False,
+        return_subtype=False,
+        return_dict=False,
+    ):
+        if return_seg:
+            raise ValueError("FoundationModel_ori does not have a segmentation head")
+        if return_subtype:
+            raise ValueError("FoundationModel_ori does not have a subtype head")
+
         feat = self.forward_features(x)
         logits = self.head(feat)
+        if return_dict:
+            return {"classification": logits}
         return logits

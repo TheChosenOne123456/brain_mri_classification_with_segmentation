@@ -1,9 +1,9 @@
 '''
-临床 K-Fold 异构集成推理脚本 (Clinical Inference via Heterogeneous Late Fusion)：
+临床 K-Fold 集成推理脚本：
 输入一个已经被预处理过的 Case ID（如 "0001"），脚本将：
 - 自动在当前默认数据实验目录(output/data-hdbet/data)下检索其 Seq1, Seq2, Seq3 的图像。
-- Seq1 和 Seq2 使用原版无分割模型 (FoundationModel_ori) 提取概率。
-- Seq3 使用多任务模型 (FoundationModel) 提取概率并输出病灶分割 Mask。
+- baseline 模式保持原异构模型组合。
+- hierarchical 模式使用三个独立训练的层级模型。
 - 最终打印三模态的融合投票结果，并将 Mask 保存到当前目录的 /infer_output 下。
 '''
 
@@ -19,8 +19,15 @@ from pathlib import Path
 
 from runtime_defaults import *
 
-from models.FoundationModel import FoundationModel
-from models.FoundationModel_ori import FoundationModel as FoundationModel_ori
+from configs.config_utils import (
+    infer_data_dir,
+    resolve_input_artifact_dir,
+)
+from models.model_factory import (
+    create_model,
+    forward_model,
+    model_capabilities,
+)
 
 from utils.dataset import load_nii_as_tensor
 from utils.train_and_test import set_seed
@@ -30,9 +37,6 @@ warnings.filterwarnings(
     "ignore",
     message="You are using `torch.load` with `weights_only=False`"
 )
-
-# 定义最终 Mask 的输出目录
-OUTPUT_DIR = TRAIN_EXPERIMENT_ROOT / "infer_output"
 
 def find_case_files(case_id, data_root):
     """
@@ -94,13 +98,19 @@ def load_tensor_from_nii(nii_path):
     return tensor, affine
 
 
-def get_model_instance(seq_idx):
-    if seq_idx == 3:
-        model = FoundationModel(num_classes=NUM_CLASSES, in_channels=1)
+def get_model_instance(seq_idx, model_set):
+    if model_set == "hierarchical":
+        model_name = "FoundationModelHierarchical"
+    elif seq_idx == 3:
         model_name = "FoundationModel"
     else:
-        model = FoundationModel_ori(num_classes=NUM_CLASSES, in_channels=1)
         model_name = "FoundationModel_ori"
+    model = create_model(
+        model_name,
+        num_classes=NUM_CLASSES,
+        in_channels=1,
+        sequence_id=seq_idx,
+    )
     return model, model_name
 
 
@@ -110,17 +120,36 @@ def main(args):
     case_id = args.id
     target_folds = [args.fold] if args.fold is not None else range(1, K_FOLDS + 1)
     
-    data_root = PROCESSED_DATA_PATH
+    data_root = infer_data_dir(args.data_root)
+    if data_root is None:
+        raise FileNotFoundError(
+            f"Could not resolve a preprocessed data directory from {args.data_root}"
+        )
+    ckpt_root = resolve_input_artifact_dir(
+        args.checkpoint_root,
+        "checkpoints",
+    )
+    ckpt_dirs = [
+        ckpt_root / f"seq{seq_id}_{seq_name}"
+        for seq_id, seq_name in enumerate(ALL_SEQUENCES, start=1)
+    ]
+    output_root = Path(args.output_root).expanduser().resolve()
+    output_dir = (
+        output_root
+        if output_root.name == "infer_output"
+        else output_root / "infer_output"
+    )
     
     # ---------- 1. 查找并加载患者数据 ----------
     nii_paths, groundtruth = find_case_files(case_id, data_root)
     original_id = get_original_case_id(case_id, data_root)
     
     print(f"\n{'='*40}")
-    print(f"=== Clinical Inference (Heterogeneous) ===")
+    print(f"=== Clinical Inference ({args.model_set}) ===")
     print(f"Preprocessed ID  : {case_id}")
     print(f"Original ID      : {original_id}")
     print(f"Ground Truth     : {groundtruth.upper() if groundtruth else 'Unknown'}")
+    print(f"Checkpoint Root  : {ckpt_root}")
     print(f"Mode             : {'Single Fold (Fold ' + str(args.fold) + ')' if args.fold else 'Ensemble (' + str(K_FOLDS) + '-Fold Averaging)'}")
     print(f"{'='*40}")
     
@@ -145,7 +174,14 @@ def main(args):
     tensor_seq3 = tensor_seq3.to(DEVICE)
 
     # 存储最终每个序列/融合的预测和掩码
-    all_fold_probs = {1: [], 2: [], 3: [], "fused": []}  # 用于保存每个 Fold 的概率分布
+    all_fold_probs = {
+        1: [],
+        2: [],
+        3: [],
+        "fused": [],
+        "main_fused": [],
+    }
+    all_fold_subtype_probs = []
     all_fold_masks = []  # 仅来自于 Seq3
     valid_folds = 0
 
@@ -154,13 +190,17 @@ def main(args):
     with torch.no_grad():
         for k in target_folds:
             fold_probs = {}
+            fold_subtype_probs = {}
             seq3_mask_fold = None
             fold_success = True
 
             # 遍历三个序列提取特征
             for seq_idx, tensor_input in zip([1, 2, 3], [tensor_seq1, tensor_seq2, tensor_seq3]):
-                model, model_name = get_model_instance(seq_idx)
-                ckpt_path = CKPT_DIRS[seq_idx - 1] / model_name / f"fold{k}_model_best.pth"
+                model, model_name = get_model_instance(
+                    seq_idx,
+                    args.model_set,
+                )
+                ckpt_path = ckpt_dirs[seq_idx - 1] / model_name / f"fold{k}_model_best.pth"
 
                 if not ckpt_path.exists():
                     print(f"[Warning] Checkpoint missing for Seq {seq_idx} at Fold {k}. Skipping this fold.")
@@ -169,31 +209,31 @@ def main(args):
                 
                 model = model.to(DEVICE)
                 checkpoint = torch.load(ckpt_path, map_location=DEVICE)
-                model.load_state_dict(checkpoint["model_state"], strict=False)
+                model.load_state_dict(checkpoint["model_state"])
                 
                 if torch.cuda.device_count() > 1:
                     model = nn.DataParallel(model)
                     
                 model.eval()
 
-                # 推理
-                if seq_idx == 3:
-                     # Seq3: 既要概率，也要分割图
-                    # 对于 FoundationModel, 当 return_seg=True 时，返回 (cls_logits, seg_logits)
-                    if hasattr(model, "module"):
-                        logits, seg_logits = model.module(tensor_input, return_seg=True)
-                    else:
-                        logits, seg_logits = model(tensor_input, return_seg=True)
-                    
-                    # 提取概率
-                    prob_np = F.softmax(logits, dim=1).cpu().numpy()[0]
-                    # 提取掩码 (argmax 得到纯类别标记 [D, H, W])
-                    mask_pred = seg_logits.argmax(dim=1).cpu().numpy()[0]  
-                    seq3_mask_fold = mask_pred
-                else:
-                    # Seq1, Seq2: 纯分类
-                    logits = model(tensor_input)
-                    prob_np = F.softmax(logits, dim=1).cpu().numpy()[0]
+                capabilities = model_capabilities(model)
+                outputs = forward_model(
+                    model,
+                    tensor_input,
+                    return_subtype=capabilities["subtype"],
+                    return_seg=capabilities["segmentation"],
+                )
+                logits = outputs["classification"]
+                prob_np = F.softmax(logits, dim=1).cpu().numpy()[0]
+
+                if capabilities["subtype"]:
+                    fold_subtype_probs[seq_idx] = (
+                        F.softmax(outputs["subtype"], dim=1).cpu().numpy()[0]
+                    )
+                if capabilities["segmentation"]:
+                    seq3_mask_fold = (
+                        outputs["segmentation"].argmax(dim=1).cpu().numpy()[0]
+                    )
 
                 fold_probs[seq_idx] = prob_np
 
@@ -201,17 +241,51 @@ def main(args):
                 continue
 
             # 对于这个 Fold，计算 Late Fusion (简单平均软投票)
-            fused_prob = np.mean([fold_probs[1], fold_probs[2], fold_probs[3]], axis=0)
+            fused_main_prob = np.mean(
+                [fold_probs[1], fold_probs[2], fold_probs[3]],
+                axis=0,
+            )
+            if args.model_set == "hierarchical":
+                fused_subtype_prob = np.mean(
+                    [
+                        fold_subtype_probs[1],
+                        fold_subtype_probs[2],
+                        fold_subtype_probs[3],
+                    ],
+                    axis=0,
+                )
+                abnormal_mass = 1.0 - fused_main_prob[0]
+                fused_prob = np.array(
+                    [
+                        fused_main_prob[0],
+                        abnormal_mass * fused_subtype_prob[0],
+                        abnormal_mass * fused_subtype_prob[1],
+                    ]
+                )
+                fold_pred_idx = (
+                    0
+                    if fused_main_prob.argmax() == 0
+                    else int(fused_subtype_prob.argmax()) + 1
+                )
+                all_fold_subtype_probs.append(fused_subtype_prob)
+            else:
+                fused_prob = fused_main_prob
+                fold_pred_idx = int(fused_prob.argmax())
 
             # 记录当前 fold 产生的结果
             all_fold_probs[1].append(fold_probs[1])
             all_fold_probs[2].append(fold_probs[2])
             all_fold_probs[3].append(fold_probs[3])
             all_fold_probs["fused"].append(fused_prob)
+            all_fold_probs["main_fused"].append(fused_main_prob)
             all_fold_masks.append(seq3_mask_fold)
             
             valid_folds += 1
-            print(f"  [Fold {k}] Integration Complete. Pred = {CLASS_NAMES[fused_prob.argmax()]} (Conf: {fused_prob.max():.4f})")
+            print(
+                f"  [Fold {k}] Integration Complete. "
+                f"Pred = {CLASS_NAMES[fold_pred_idx]} "
+                f"(display score: {fused_prob[fold_pred_idx]:.4f})"
+            )
 
     if valid_folds == 0:
         print("\n[Error] No valid models were loaded across any fold. Exiting.")
@@ -228,10 +302,24 @@ def main(args):
     }
 
     print("-" * 75)
-    print(f"{'Class Name':<15} | {'Seq1 (T1_ori)':<12} | {'Seq2 (T2_ori)':<12} | {'Seq3 (FLAIR_mt)':<14} || {'FUSED (VOTE)':<12}")
+    seq_suffix = "hier" if args.model_set == "hierarchical" else "baseline"
+    print(
+        f"{'Class Name':<15} | {'Seq1 (' + seq_suffix + ')':<16} | "
+        f"{'Seq2 (' + seq_suffix + ')':<16} | "
+        f"{'Seq3 (' + seq_suffix + ')':<16} || {'FUSED':<12}"
+    )
     print("-" * 75)
     
-    fused_pred_idx = avg_probs["fused"].argmax()
+    if args.model_set == "hierarchical":
+        avg_main_prob = np.mean(all_fold_probs["main_fused"], axis=0)
+        avg_subtype_prob = np.mean(all_fold_subtype_probs, axis=0)
+        fused_pred_idx = (
+            0
+            if avg_main_prob.argmax() == 0
+            else int(avg_subtype_prob.argmax()) + 1
+        )
+    else:
+        fused_pred_idx = int(avg_probs["fused"].argmax())
     
     for idx, class_name in enumerate(CLASS_NAMES):
         p1 = avg_probs[1][idx]
@@ -263,8 +351,8 @@ def main(args):
             # (简化的多数投票。如果是偶数 fold，可能会有并列情况，目前策略是谁数字大被谁覆盖)
             final_mask[votes_for_label > (valid_folds / 2)] = label_val
             
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        out_nii_path = OUTPUT_DIR / f"case_{case_id}_FLAIR_mask_pred.nii.gz"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        out_nii_path = output_dir / f"case_{case_id}_FLAIR_mask_pred.nii.gz"
         
         # 模型内部统一使用 [Z, Y, X]；写回 NIfTI 时恢复 nibabel 的 [X, Y, Z]。
         final_mask_nifti = np.transpose(final_mask, (2, 1, 0))
@@ -289,6 +377,27 @@ if __name__ == "__main__":
         default=None,
         choices=range(1, K_FOLDS + 1),
         help=f"Specific fold to use (1~{K_FOLDS}). If not set, use all {K_FOLDS} folds and average.",
+    )
+    parser.add_argument(
+        "--model-set",
+        choices=("baseline", "hierarchical"),
+        default="baseline",
+        help="Choose the existing heterogeneous ensemble or the hierarchical models.",
+    )
+    parser.add_argument(
+        "--data-root",
+        default=str(DATA_EXPERIMENT_ROOT),
+        help="Data experiment root containing preprocessed data.",
+    )
+    parser.add_argument(
+        "--checkpoint-root",
+        default=str(TRAIN_EXPERIMENT_ROOT),
+        help="Training output root containing checkpoints.",
+    )
+    parser.add_argument(
+        "--output-root",
+        default=str(TRAIN_EXPERIMENT_ROOT),
+        help="Output root; masks are written under infer_output.",
     )
     
     args = parser.parse_args()

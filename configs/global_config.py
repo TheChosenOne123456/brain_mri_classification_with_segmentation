@@ -50,4 +50,6 @@ MASK_ROOTS = [
     Path("/home/ailab/data/brainMRI/脑炎mask6"),
     Path("/home/ailab/data/brainMRI/脑炎mask7"),
     Path("/home/ailab/data/brainMRI/脑炎mask8"),
+    Path("/home/ailab/data/brainMRI/脑炎mask9"),
+    Path("/home/ailab/data/brainMRI/脑炎mask10"),
 ]

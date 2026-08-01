@@ -2,9 +2,16 @@
 K-Fold 训练脚本：指定 --fold 参数 (1~5) 进行训练
 模型将保存为 fold{k}_model_best.pth
 [适配新服务器：8x RTX 3080]
+
+层级模型示例（seq1/seq2 无分割头，seq3 自动启用分割头）：
+python train_kfold.py --config output/runs-hierarchical/train_config.py \
+  --data-root output/data-hdbet --output-root output/runs-hierarchical \
+  --seq 1 --model FoundationModelHierarchical --fold 1
 '''
 import argparse
 import sys
+from dataclasses import asdict, dataclass
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -30,14 +37,19 @@ from configs.config_utils import (
 )
 from configs.global_config import (
     ALL_SEQUENCES,
+    CLASS_NAMES,
     K_FOLDS,
     NUM_CLASSES,
     SEED,
 )
-from models.cnn3d import Simple3DCNN
-from models.ResNet import ResNet10, ResNet18
-from models.FoundationModel import FoundationModel
-from models.FoundationModel_ori import FoundationModel as FoundationModel_ori
+from models.model_factory import (
+    MODEL_CHOICES,
+    create_model,
+    forward_model,
+    hierarchical_predictions,
+    model_capabilities,
+    required_train_config_fields,
+)
 from utils.losses import ClassBalancedFocalLoss
 from utils.train_and_test import set_seed, load_pt_dataset
 
@@ -45,9 +57,9 @@ import warnings
 warnings.filterwarnings("ignore", message="You are using `torch.load` with `weights_only=False`")
 
 
-def apply_train_config(config):
+def apply_train_config(config, field_names):
     """让训练循环继续使用原有同名常量，避免改动核心训练流程。"""
-    for name in TRAIN_CONFIG_FIELDS:
+    for name in field_names:
         globals()[name] = getattr(config, name)
 
 
@@ -119,6 +131,181 @@ def build_classification_criterion(class_counts, total_samples):
         f"Unsupported CLASSIFICATION_LOSS: {CLASSIFICATION_LOSS}. "
         "Expected cross_entropy, weighted_cross_entropy, or class_balanced_focal."
     )
+
+
+def build_subtype_criterion(class_counts):
+    """仅针对 inflammation/metastasis 构建配置化加权的二分类损失。"""
+    subtype_counts = class_counts[1:].float()
+    if len(subtype_counts) != 2 or torch.any(subtype_counts <= 0):
+        raise ValueError(
+            "The subtype head needs both inflammation and metastasis samples, "
+            f"got class counts {class_counts.tolist()}"
+        )
+    raw_weights = subtype_counts.sum() / (2 * subtype_counts + 1e-6)
+    subtype_weights = torch.pow(
+        raw_weights,
+        SUBTYPE_CLASS_WEIGHT_POWER,
+    ).to(DEVICE)
+    print(f"Subtype Class Weights: {subtype_weights.tolist()}")
+    print(
+        "Subtype Loss: weighted CrossEntropyLoss "
+        f"(alpha={SUBTYPE_ALPHA}, power={SUBTYPE_CLASS_WEIGHT_POWER})"
+    )
+    return nn.CrossEntropyLoss(weight=subtype_weights)
+
+
+def compute_subtype_loss(subtype_logits, labels, subtype_criterion):
+    """正常样本不参与子类头损失；异常标签 1/2 映射为子类标签 0/1。"""
+    abnormal = labels > 0
+    if abnormal.any():
+        return subtype_criterion(
+            subtype_logits[abnormal],
+            labels[abnormal] - 1,
+        )
+    return subtype_logits.sum() * 0.0
+
+
+def compute_class_metrics(targets, predictions, class_index, beta=1.0):
+    """计算指定类别的 precision、recall 和 F-beta。"""
+    targets = np.asarray(targets)
+    predictions = np.asarray(predictions)
+    true_positive = int(
+        np.sum((targets == class_index) & (predictions == class_index))
+    )
+    predicted_positive = int(np.sum(predictions == class_index))
+    actual_positive = int(np.sum(targets == class_index))
+
+    precision = (
+        true_positive / predicted_positive
+        if predicted_positive > 0
+        else 0.0
+    )
+    recall = (
+        true_positive / actual_positive
+        if actual_positive > 0
+        else 0.0
+    )
+    beta_squared = beta ** 2
+    denominator = beta_squared * precision + recall
+    fbeta = (
+        (1 + beta_squared) * precision * recall / denominator
+        if denominator > 0
+        else 0.0
+    )
+    return {
+        "precision": float(precision),
+        "recall": float(recall),
+        "fbeta": float(fbeta),
+    }
+
+
+@dataclass(frozen=True)
+class CheckpointCandidate:
+    """一个 epoch 的验证表现及其 checkpoint 选择优先级。"""
+
+    epoch: int
+    primary_metric_name: str
+    primary_metric_value: float
+    macro_f1: float
+    val_loss: float
+    val_accuracy: float
+    metastasis_precision: float
+    metastasis_recall: float
+    metastasis_fbeta: float
+    accuracy_constraint_met: bool
+    precision_constraint_met: bool
+
+    @property
+    def constraints_met(self):
+        return (
+            self.accuracy_constraint_met
+            and self.precision_constraint_met
+        )
+
+
+def build_checkpoint_candidate(
+    *,
+    epoch,
+    val_loss,
+    val_accuracy,
+    macro_f1,
+    metastasis_metrics,
+    selection_metric,
+    min_accuracy,
+    min_metastasis_precision,
+):
+    """将验证指标转换为清晰、可比较的 checkpoint 候选。"""
+    if selection_metric == "metastasis_fbeta":
+        primary_metric_value = metastasis_metrics["fbeta"]
+    elif selection_metric == "macro_f1":
+        primary_metric_value = macro_f1
+    else:
+        raise ValueError(
+            f"Unsupported CHECKPOINT_SELECTION_METRIC: {selection_metric}. "
+            "Expected metastasis_fbeta or macro_f1."
+        )
+
+    return CheckpointCandidate(
+        epoch=epoch,
+        primary_metric_name=selection_metric,
+        primary_metric_value=float(primary_metric_value),
+        macro_f1=float(macro_f1),
+        val_loss=float(val_loss),
+        val_accuracy=float(val_accuracy),
+        metastasis_precision=float(metastasis_metrics["precision"]),
+        metastasis_recall=float(metastasis_metrics["recall"]),
+        metastasis_fbeta=float(metastasis_metrics["fbeta"]),
+        accuracy_constraint_met=bool(val_accuracy >= min_accuracy),
+        precision_constraint_met=bool(
+            metastasis_metrics["precision"] >= min_metastasis_precision
+        ),
+    )
+
+
+def is_better_checkpoint(candidate, best_candidate, metric_tolerance):
+    """
+    约束优先，其次目标指标；近似持平时偏好 macro-F1、低 loss 和早期 epoch。
+    """
+    if best_candidate is None:
+        return True
+    if candidate.constraints_met != best_candidate.constraints_met:
+        return candidate.constraints_met
+
+    primary_delta = (
+        candidate.primary_metric_value
+        - best_candidate.primary_metric_value
+    )
+    if abs(primary_delta) > metric_tolerance:
+        return primary_delta > 0
+
+    macro_f1_delta = candidate.macro_f1 - best_candidate.macro_f1
+    if abs(macro_f1_delta) > metric_tolerance:
+        return macro_f1_delta > 0
+
+    if candidate.val_loss != best_candidate.val_loss:
+        return candidate.val_loss < best_candidate.val_loss
+    return candidate.epoch < best_candidate.epoch
+
+
+def compute_segmentation_loss(
+    seg_logits,
+    mask,
+    mask_flag,
+    seg_criterion,
+):
+    gt_mask = mask.squeeze(1) if mask.dim() == 5 else mask
+    unreduced_seg_loss = seg_criterion(seg_logits, gt_mask)
+    per_sample_ce_loss = unreduced_seg_loss.mean(dim=(1, 2, 3))
+    per_sample_dice_loss = compute_dice_loss(
+        seg_logits,
+        gt_mask,
+        num_classes=NUM_CLASSES,
+    )
+    per_sample_total = per_sample_ce_loss + per_sample_dice_loss
+    valid_mask_count = mask_flag.sum()
+    if valid_mask_count > 0:
+        return (per_sample_total * mask_flag).sum() / valid_mask_count
+    return seg_logits.sum() * 0.0
 
 
 def compute_dice(pred_mask, gt_mask, num_classes=3, smooth=1e-5):
@@ -212,19 +399,200 @@ def calculate_accuracy(loader, model, device):
             x, y = x.to(device), y.to(device)
             # 验证时也开启 autocast 以节省显存
             with autocast(**({'device_type': 'cuda'} if 'device' in scaler_args else {})):
-                # 如果是双头模型我们这里只测分类性能，取第一个返回值
-                if hasattr(model, 'module') and isinstance(model.module, FoundationModel) or isinstance(model, FoundationModel):
-                     outputs = model(x, return_seg=False)
-                else:
-                     outputs = model(x)
+                outputs = forward_model(model, x)["classification"]
             _, predicted = torch.max(outputs.data, 1)
             total += y.size(0)
             correct += (predicted == y).sum().item()
     return correct / total
 
+
+def _initial_model_name_for_sequence(initial_model_names, sequence_id):
+    if isinstance(initial_model_names, dict):
+        model_name = initial_model_names.get(
+            sequence_id,
+            initial_model_names.get(str(sequence_id)),
+        )
+    elif isinstance(initial_model_names, (list, tuple)):
+        model_name = (
+            initial_model_names[sequence_id - 1]
+            if len(initial_model_names) >= sequence_id
+            else None
+        )
+    else:
+        model_name = None
+
+    if not model_name:
+        raise ValueError(
+            "INITIAL_MODEL_NAMES must provide a source model for "
+            f"sequence {sequence_id}"
+        )
+    return model_name
+
+
+def initialize_from_baseline_checkpoint(
+    model,
+    *,
+    config,
+    init_checkpoint_root,
+    sequence_id,
+    sequence_name,
+    fold,
+    in_channels,
+):
+    """加载同序列、同 fold 的历史基线，并复制共享模块。"""
+    initial_model_names = getattr(config, "INITIAL_MODEL_NAMES", None)
+    source_model_name = _initial_model_name_for_sequence(
+        initial_model_names,
+        sequence_id,
+    )
+    source_checkpoint_root = resolve_input_artifact_dir(
+        init_checkpoint_root,
+        "checkpoints",
+    )
+    source_checkpoint_path = (
+        source_checkpoint_root
+        / f"seq{sequence_id}_{sequence_name}"
+        / source_model_name
+        / f"fold{fold}_model_best.pth"
+    )
+    if not source_checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f"Baseline checkpoint not found: {source_checkpoint_path}"
+        )
+
+    source_model = create_model(
+        source_model_name,
+        num_classes=NUM_CLASSES,
+        in_channels=in_channels,
+        sequence_id=sequence_id,
+    )
+    checkpoint = torch.load(
+        source_checkpoint_path,
+        map_location="cpu",
+        weights_only=False,
+    )
+    source_state = (
+        checkpoint["model_state"]
+        if isinstance(checkpoint, dict) and "model_state" in checkpoint
+        else checkpoint
+    )
+    source_model.load_state_dict(source_state, strict=True)
+
+    initialize_method = getattr(model, "initialize_from_baseline", None)
+    if initialize_method is None:
+        raise TypeError(
+            f"{model.__class__.__name__} does not support baseline initialization"
+        )
+    copied_parts = initialize_method(source_model)
+    print(f"Initialized from: {source_checkpoint_path}")
+    print(f"Copied model parts: {', '.join(copied_parts)}")
+    return {
+        "source_model_name": source_model_name,
+        "source_checkpoint_path": str(source_checkpoint_path),
+        "copied_model_parts": copied_parts,
+    }
+
+
+def configure_trainable_model_parts(model, trainable_model_parts):
+    """冻结整个模型后，仅重新启用配置中列出的模块。"""
+    if trainable_model_parts is None:
+        return None
+    if isinstance(trainable_model_parts, str):
+        trainable_model_parts = (trainable_model_parts,)
+    trainable_model_parts = tuple(trainable_model_parts)
+    if not trainable_model_parts:
+        raise ValueError("TRAINABLE_MODEL_PARTS cannot be empty")
+
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+
+    for part_name in trainable_model_parts:
+        try:
+            module = model.get_submodule(part_name)
+        except AttributeError as error:
+            available = ", ".join(name for name, _ in model.named_children())
+            raise ValueError(
+                f"Unknown trainable model part: {part_name}. "
+                f"Top-level parts: {available}"
+            ) from error
+        for parameter in module.parameters():
+            parameter.requires_grad = True
+
+    trainable_parameters = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+    total_parameters = sum(parameter.numel() for parameter in model.parameters())
+    if trainable_parameters == 0:
+        raise ValueError(
+            f"TRAINABLE_MODEL_PARTS {trainable_model_parts} contain no parameters"
+        )
+    print(f"Trainable Model Parts: {', '.join(trainable_model_parts)}")
+    print(
+        "Trainable Parameters: "
+        f"{trainable_parameters:,}/{total_parameters:,} "
+        f"({trainable_parameters / total_parameters:.4%})"
+    )
+    return trainable_model_parts
+
+
+def keep_frozen_modules_in_eval_mode(model):
+    """model.train() 后保持完全冻结的顶层模块处于 eval 模式。"""
+    base_model = model.module if isinstance(model, nn.DataParallel) else model
+    for module in base_model.children():
+        parameters = tuple(module.parameters())
+        if parameters and not any(
+            parameter.requires_grad for parameter in parameters
+        ):
+            module.eval()
+
+
+def model_part_has_trainable_parameters(model, part_name):
+    try:
+        module = model.get_submodule(part_name)
+    except AttributeError:
+        return False
+    return any(parameter.requires_grad for parameter in module.parameters())
+
+
 def main(args):
-    config = load_python_config(args.config, TRAIN_CONFIG_FIELDS)
-    apply_train_config(config)
+    model_name = args.model
+    train_config_fields = (
+        TRAIN_CONFIG_FIELDS + required_train_config_fields(model_name)
+    )
+    config = load_python_config(args.config, train_config_fields)
+    apply_train_config(config, train_config_fields)
+    classification_alpha = float(
+        getattr(config, "CLASSIFICATION_ALPHA", 1.0)
+    )
+    initialize_from_baseline = bool(
+        getattr(config, "INITIALIZE_FROM_BASELINE", False)
+        or args.init_checkpoint_root is not None
+    )
+    trainable_model_parts = getattr(
+        config,
+        "TRAINABLE_MODEL_PARTS",
+        None,
+    )
+    checkpoint_selection_metric = getattr(
+        config,
+        "CHECKPOINT_SELECTION_METRIC",
+        "macro_f1",
+    )
+    metastasis_f_beta = float(
+        getattr(config, "METASTASIS_F_BETA", 2.0)
+    )
+    min_metastasis_precision = float(
+        getattr(
+            config,
+            "HIERARCHICAL_MIN_VAL_METASTASIS_PRECISION",
+            0.0,
+        )
+    )
+    checkpoint_metric_tolerance = float(
+        getattr(config, "CHECKPOINT_METRIC_TOLERANCE", 1e-4)
+    )
 
     dataset_root = resolve_input_artifact_dir(args.data_root, "datasets")
     processed_data_root = infer_data_dir(args.data_root)
@@ -241,15 +609,25 @@ def main(args):
     set_seed(SEED)
     
     current_fold = args.fold
-    model_name = args.model
-
     print(f"Training config : {config.__config_path__}")
     print(f"Dataset input   : {dataset_root}")
     print(f"Checkpoint root : {ckpt_root}")
     train_config_snapshot = {
         name: getattr(config, name)
-        for name in TRAIN_CONFIG_FIELDS
+        for name in train_config_fields
     }
+    train_config_snapshot.update({
+        "CLASSIFICATION_ALPHA": classification_alpha,
+        "INITIALIZE_FROM_BASELINE": initialize_from_baseline,
+        "INITIAL_MODEL_NAMES": getattr(config, "INITIAL_MODEL_NAMES", None),
+        "TRAINABLE_MODEL_PARTS": trainable_model_parts,
+        "CHECKPOINT_SELECTION_METRIC": checkpoint_selection_metric,
+        "METASTASIS_F_BETA": metastasis_f_beta,
+        "HIERARCHICAL_MIN_VAL_METASTASIS_PRECISION": (
+            min_metastasis_precision
+        ),
+        "CHECKPOINT_METRIC_TOLERANCE": checkpoint_metric_tolerance,
+    })
     
     if args.seq is not None:
         # ---- 单通道模式 ----
@@ -318,26 +696,56 @@ def main(args):
     train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
     val_loader   = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
 
-    # 初始化模型
-    if model_name == "cnn3d":
-        ModelClass = Simple3DCNN
-    elif model_name == "ResNet":
-        ModelClass = ResNet10
-    elif model_name == "ResNet18":
-        ModelClass = ResNet18
-    elif model_name == "FoundationModel":
-        ModelClass = FoundationModel
-    elif model_name == "FoundationModel_ori":
-        ModelClass = FoundationModel_ori
-    else:
-        raise ValueError(f"Unknown model: {model_name}")
+    model = create_model(
+        model_name,
+        num_classes=NUM_CLASSES,
+        in_channels=in_channels,
+        sequence_id=args.seq,
+    )
+    capabilities = model_capabilities(model)
+    print(f"Model Capabilities: {capabilities}")
 
-    # [修改] 尝试动态传入 in_channels，保证兼容性
-    try:
-        model = ModelClass(num_classes=NUM_CLASSES, in_channels=in_channels)
-    except TypeError:
-        print(f"[Warning] {model_name} does not accept 'in_channels'. Using default.")
-        model = ModelClass(num_classes=NUM_CLASSES)
+    initialization_metadata = None
+    if initialize_from_baseline:
+        if args.seq is None:
+            raise ValueError(
+                "Baseline initialization requires an explicit --seq"
+            )
+        if args.init_checkpoint_root is None:
+            raise ValueError(
+                "This config enables baseline initialization; pass "
+                "--init-checkpoint-root"
+            )
+        initialization_metadata = initialize_from_baseline_checkpoint(
+            model,
+            config=config,
+            init_checkpoint_root=args.init_checkpoint_root,
+            sequence_id=args.seq,
+            sequence_name=seq_name,
+            fold=current_fold,
+            in_channels=in_channels,
+        )
+
+    configured_trainable_parts = configure_trainable_model_parts(
+        model,
+        trainable_model_parts,
+    )
+    use_subtype_loss = (
+        capabilities["subtype"]
+        and SUBTYPE_ALPHA > 0
+        and model_part_has_trainable_parameters(model, "subtype_head")
+    )
+    use_segmentation_loss = (
+        capabilities["segmentation"]
+        and SEG_ALPHA > 0
+        and model_part_has_trainable_parameters(model, "aux_heads")
+    )
+    if capabilities["subtype"] and not use_subtype_loss:
+        print("Subtype Loss: disabled")
+    if capabilities["segmentation"] and not use_segmentation_loss:
+        print("Segmentation Loss: disabled (head is frozen or SEG_ALPHA <= 0)")
+    if classification_alpha <= 0:
+        print("Classification Loss Contribution: disabled (alpha=0)")
 
     model = model.to(DEVICE)
 
@@ -350,22 +758,42 @@ def main(args):
     class_counts = torch.bincount(torch.tensor(all_labels), minlength=NUM_CLASSES)
     total_samples = len(all_labels)
     criterion = build_classification_criterion(class_counts, total_samples)
+    subtype_criterion = (
+        build_subtype_criterion(class_counts)
+        if use_subtype_loss
+        else None
+    )
 
-    # 在设备上创建一个极其侧重类别 1 和 2 的权重
-    # 假设背景权重很小(0.1)，炎症权重10.0，转移瘤权重10.0
-    seg_class_weights = torch.tensor(SEG_CLASS_WEIGHTS, dtype=torch.float32).to(DEVICE)
-
-    # 应用于分割交叉熵
-    seg_criterion = nn.CrossEntropyLoss(weight=seg_class_weights, reduction='none')
+    seg_criterion = None
+    if use_segmentation_loss:
+        seg_class_weights = torch.tensor(
+            SEG_CLASS_WEIGHTS,
+            dtype=torch.float32,
+            device=DEVICE,
+        )
+        seg_criterion = nn.CrossEntropyLoss(
+            weight=seg_class_weights,
+            reduction="none",
+        )
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    trainable_parameters = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    ]
+    if not trainable_parameters:
+        raise ValueError("The selected training configuration has no trainable parameters")
+    optimizer = torch.optim.Adam(
+        trainable_parameters,
+        lr=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY,
+    )
 
     # 初始化混合精度 Scaler
     scaler = GradScaler(**scaler_args)
 
     # 训练循环 &早停
-    best_val_loss = float("inf")
-    best_val_f1 = 0.0  # 初始化为 0，越大越好
+    best_candidate = None
     patience_counter = 0
     best_epoch = 0
 
@@ -375,6 +803,7 @@ def main(args):
     for epoch in range(1, NUM_EPOCHS + 1):
         # --- Train ---
         model.train()
+        keep_frozen_modules_in_eval_mode(model)
         total_loss = 0.0
         train_correct = 0
         train_total = 0 
@@ -394,43 +823,33 @@ def main(args):
                 actx = autocast()
 
             with actx:
-                if model_name == "FoundationModel":
-                    # [修复] 必须严格作为位置参数（不带 "return_seg="）传入，防止 DataParallel 解析乱套！
-                    logits, seg_logits = model(x, True)
-                    loss_cls = criterion(logits, y)
-                    
-                    # 取出没有经过reduction的各个像素的损失 (mask去掉第一维单通道的壳子)
-                    gt_mask = mask.squeeze(1)
-                    unreduced_seg_loss = seg_criterion(seg_logits, gt_mask)
-                    
-                    # 算出Batch里每张图平均的空间Loss：[B, D, H, W] -> [B]
-                    per_sample_ce_loss = unreduced_seg_loss.mean(dim=[1, 2, 3])
-                    
-                    # [新增] 算出Batch里每张图的 Dice Loss: [B]
-                    # 因为我们传入的 compute_dice_loss 会针对每张图返回平均损失，我们可以在里面稍微调整使其按样本返回，
-                    # 简便起见，这里假设 compute_dice_loss 返回的是 [B] 形状的张量（你可以修改上方公式不进行 mean(0)）
-                    
-                    # --- 为配合上方的代码，将上方 compute_dice_loss 的返回值改为不对 Batch 取平均 ---
-                    # 即 return (dice_loss / (num_classes - 1))  # 这个就是 [B] 大小的
-                    per_sample_dice_loss = compute_dice_loss(seg_logits, gt_mask, num_classes=NUM_CLASSES)
-                    
-                    # 将两个 Loss 缝合 (通常按照 1:1 的比例即可)
-                    per_sample_total_seg_loss = per_sample_ce_loss + per_sample_dice_loss
-                    
-                    # 使用 Flag 作为开关，把那些没有遮罩标注又不是正常脑炎的“伪标签图像”损失强行清零
-                    masked_seg_loss = (per_sample_total_seg_loss * mask_flag).sum()
-                    
-                    valid_mask_count = mask_flag.sum()
-                    if valid_mask_count > 0:
-                        loss_seg = masked_seg_loss / valid_mask_count
-                    else:
-                        loss_seg = 0.0
-                        
-                    loss = loss_cls + SEG_ALPHA * loss_seg
-                else:
-                    # 单任务模型
-                    logits = model(x)
-                    loss = criterion(logits, y)
+                outputs = forward_model(
+                    model,
+                    x,
+                    return_subtype=capabilities["subtype"],
+                    return_seg=use_segmentation_loss,
+                )
+                logits = outputs["classification"]
+                loss = logits.sum() * 0.0
+                if classification_alpha > 0:
+                    loss = loss + classification_alpha * criterion(logits, y)
+
+                if use_subtype_loss:
+                    loss_subtype = compute_subtype_loss(
+                        outputs["subtype"],
+                        y,
+                        subtype_criterion,
+                    )
+                    loss = loss + SUBTYPE_ALPHA * loss_subtype
+
+                if use_segmentation_loss:
+                    loss_seg = compute_segmentation_loss(
+                        outputs["segmentation"],
+                        mask,
+                        mask_flag,
+                        seg_criterion,
+                    )
+                    loss = loss + SEG_ALPHA * loss_seg
             
             # AMP 反向传播
             scaler.scale(loss).backward()
@@ -452,6 +871,9 @@ def main(args):
         val_total = 0
         
         all_preds = []
+        all_hierarchical_preds = []
+        all_subtype_preds = []
+        all_subtype_targets = []
         all_targets = []
         
         valid_seg_dices = []  # <--- [新增] 收集每个 Batch 的有效 Dice
@@ -467,13 +889,33 @@ def main(args):
                     actx = autocast()
                 
                 with actx:
-                    if model_name == "FoundationModel":
-                        # [修改] 开启验证集的分割预测 (传入 True)
-                        logits, seg_logits = model(x, True)
-                    else:
-                        logits = model(x)
-                        seg_logits = None
-                    loss = criterion(logits, y)
+                    outputs = forward_model(
+                        model,
+                        x,
+                        return_subtype=capabilities["subtype"],
+                        return_seg=use_segmentation_loss,
+                    )
+                    logits = outputs["classification"]
+                    seg_logits = outputs.get("segmentation")
+                    loss = logits.sum() * 0.0
+                    if classification_alpha > 0:
+                        loss = (
+                            loss
+                            + classification_alpha * criterion(logits, y)
+                        )
+                    if use_subtype_loss:
+                        loss = loss + SUBTYPE_ALPHA * compute_subtype_loss(
+                            outputs["subtype"],
+                            y,
+                            subtype_criterion,
+                        )
+                    if use_segmentation_loss:
+                        loss = loss + SEG_ALPHA * compute_segmentation_loss(
+                            outputs["segmentation"],
+                            mask,
+                            mask_flag,
+                            seg_criterion,
+                        )
 
                 # ----- 计算和记录验证集 Dice -----
                 if seg_logits is not None:
@@ -491,6 +933,23 @@ def main(args):
 
 
                 all_preds.extend(predicted.cpu().numpy())
+                if capabilities["subtype"]:
+                    hierarchical_pred = hierarchical_predictions(
+                        logits,
+                        outputs["subtype"],
+                    )
+                    all_hierarchical_preds.extend(
+                        hierarchical_pred.cpu().numpy()
+                    )
+                    abnormal = y > 0
+                    if abnormal.any():
+                        subtype_pred = outputs["subtype"].argmax(dim=1)
+                        all_subtype_preds.extend(
+                            subtype_pred[abnormal].cpu().numpy()
+                        )
+                        all_subtype_targets.extend(
+                            (y[abnormal] - 1).cpu().numpy()
+                        )
                 all_targets.extend(y.cpu().numpy())
 
                 val_total += y.size(0)
@@ -499,18 +958,130 @@ def main(args):
         val_loss /= len(val_loader)
         val_acc = val_correct / val_total
         val_f1 = f1_score(all_targets, all_preds, average='macro', zero_division=0)
+        metastasis_class_index = CLASS_NAMES.index("metastasis")
+        val_metastasis_metrics = compute_class_metrics(
+            all_targets,
+            all_preds,
+            metastasis_class_index,
+            beta=metastasis_f_beta,
+        )
+        val_hierarchical_f1 = (
+            f1_score(
+                all_targets,
+                all_hierarchical_preds,
+                average="macro",
+                zero_division=0,
+            )
+            if capabilities["subtype"]
+            else None
+        )
+        val_hierarchical_acc = (
+            float(
+                np.mean(
+                    np.asarray(all_hierarchical_preds)
+                    == np.asarray(all_targets)
+                )
+            )
+            if capabilities["subtype"]
+            else None
+        )
+        val_hierarchical_metastasis_metrics = (
+            compute_class_metrics(
+                all_targets,
+                all_hierarchical_preds,
+                metastasis_class_index,
+                beta=metastasis_f_beta,
+            )
+            if capabilities["subtype"]
+            else None
+        )
+        val_subtype_metastasis_metrics = (
+            compute_class_metrics(
+                all_subtype_targets,
+                all_subtype_preds,
+                metastasis_class_index - 1,
+                beta=metastasis_f_beta,
+            )
+            if capabilities["subtype"]
+            else None
+        )
+        selection_accuracy = (
+            val_hierarchical_acc
+            if val_hierarchical_acc is not None
+            else val_acc
+        )
+        selection_macro_f1 = (
+            val_hierarchical_f1
+            if val_hierarchical_f1 is not None
+            else val_f1
+        )
+        selection_metastasis_metrics = (
+            val_hierarchical_metastasis_metrics
+            if val_hierarchical_metastasis_metrics is not None
+            else val_metastasis_metrics
+        )
+        effective_selection_metric = (
+            checkpoint_selection_metric
+            if capabilities["subtype"]
+            else "macro_f1"
+        )
+        candidate = build_checkpoint_candidate(
+            epoch=epoch,
+            val_loss=val_loss,
+            val_accuracy=selection_accuracy,
+            macro_f1=selection_macro_f1,
+            metastasis_metrics=selection_metastasis_metrics,
+            selection_metric=effective_selection_metric,
+            min_accuracy=(
+                HIERARCHICAL_MIN_VAL_ACCURACY
+                if capabilities["subtype"]
+                else 0.0
+            ),
+            min_metastasis_precision=(
+                min_metastasis_precision
+                if capabilities["subtype"]
+                else 0.0
+            ),
+        )
 
         val_dice = np.mean(valid_seg_dices) if len(valid_seg_dices) > 0 else 0.0
 
         # --- 打印格式 ---
-        print(f"Epoch [{epoch}/{NUM_EPOCHS}] "
-              f"train_loss: {train_loss:.4f} | train_acc: {train_acc:.4f}   "
-              f"val_loss: {val_loss:.4f} | val_acc: {val_acc:.4f} | val_f1: {val_f1:.4f} | val_dice: {val_dice:.4f}")
+        log_line = (
+            f"Epoch [{epoch}/{NUM_EPOCHS}] "
+            f"train_loss: {train_loss:.4f} | train_acc: {train_acc:.4f}   "
+            f"val_loss: {val_loss:.4f} | val_acc: {val_acc:.4f} | "
+            f"val_f1: {val_f1:.4f} | "
+            f"val_meta_recall: {val_metastasis_metrics['recall']:.4f}"
+        )
+        if val_hierarchical_f1 is not None:
+            constraint_status = "OK" if candidate.constraints_met else "BELOW"
+            log_line += (
+                f" | val_hier_acc: {val_hierarchical_acc:.4f}"
+                f" | val_hier_f1: {val_hierarchical_f1:.4f}"
+                f" | val_subtype_meta_recall: "
+                f"{val_subtype_metastasis_metrics['recall']:.4f}"
+                f" | val_hier_meta_precision: "
+                f"{val_hierarchical_metastasis_metrics['precision']:.4f}"
+                f" | val_hier_meta_recall: "
+                f"{val_hierarchical_metastasis_metrics['recall']:.4f}"
+                f" | val_hier_meta_f{metastasis_f_beta:g}: "
+                f"{val_hierarchical_metastasis_metrics['fbeta']:.4f}"
+                f" | selection_constraint: {constraint_status}"
+            )
+        if use_segmentation_loss:
+            log_line += f" | val_dice: {val_dice:.4f}"
+        print(log_line)
 
         # --- Early Stopping check with MIN_EPOCHS ---
-        if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
-            best_val_loss = val_loss
+        is_improvement = is_better_checkpoint(
+            candidate,
+            best_candidate,
+            checkpoint_metric_tolerance,
+        )
+
+        if is_improvement:
+            best_candidate = candidate
             patience_counter = 0
             best_epoch = epoch
             
@@ -521,9 +1092,83 @@ def main(args):
                 "model_state": model_to_save.state_dict(),
                 "fold": current_fold,
                 "epoch": epoch,
-                "val_loss": best_val_loss,
+                "val_loss": val_loss,
                 "val_acc": val_acc,
                 "val_f1": val_f1,
+                "val_metastasis_precision": (
+                    val_metastasis_metrics["precision"]
+                ),
+                "val_metastasis_recall": val_metastasis_metrics["recall"],
+                "val_metastasis_fbeta": val_metastasis_metrics["fbeta"],
+                "val_hierarchical_f1": val_hierarchical_f1,
+                "val_hierarchical_acc": val_hierarchical_acc,
+                "val_hierarchical_metastasis_precision": (
+                    val_hierarchical_metastasis_metrics["precision"]
+                    if val_hierarchical_metastasis_metrics is not None
+                    else None
+                ),
+                "val_hierarchical_metastasis_recall": (
+                    val_hierarchical_metastasis_metrics["recall"]
+                    if val_hierarchical_metastasis_metrics is not None
+                    else None
+                ),
+                "val_hierarchical_metastasis_fbeta": (
+                    val_hierarchical_metastasis_metrics["fbeta"]
+                    if val_hierarchical_metastasis_metrics is not None
+                    else None
+                ),
+                "val_subtype_metastasis_precision": (
+                    val_subtype_metastasis_metrics["precision"]
+                    if val_subtype_metastasis_metrics is not None
+                    else None
+                ),
+                "val_subtype_metastasis_recall": (
+                    val_subtype_metastasis_metrics["recall"]
+                    if val_subtype_metastasis_metrics is not None
+                    else None
+                ),
+                "val_subtype_metastasis_fbeta": (
+                    val_subtype_metastasis_metrics["fbeta"]
+                    if val_subtype_metastasis_metrics is not None
+                    else None
+                ),
+                "meets_accuracy_constraint": (
+                    candidate.accuracy_constraint_met
+                ),
+                "meets_precision_constraint": (
+                    candidate.precision_constraint_met
+                ),
+                "meets_selection_constraints": candidate.constraints_met,
+                "hierarchical_min_val_accuracy": (
+                    HIERARCHICAL_MIN_VAL_ACCURACY
+                    if capabilities["subtype"]
+                    else None
+                ),
+                "hierarchical_min_val_metastasis_precision": (
+                    min_metastasis_precision
+                    if capabilities["subtype"]
+                    else None
+                ),
+                "selection_metric": effective_selection_metric,
+                "selection_candidate": {
+                    **asdict(candidate),
+                    "constraints_met": candidate.constraints_met,
+                },
+                "model_name": model_name,
+                "model_capabilities": capabilities,
+                "classification_alpha": classification_alpha,
+                "subtype_loss": (
+                    "weighted_cross_entropy"
+                    if use_subtype_loss
+                    else None
+                ),
+                "subtype_class_weights": (
+                    subtype_criterion.weight.detach().cpu().tolist()
+                    if use_subtype_loss
+                    else None
+                ),
+                "trainable_model_parts": configured_trainable_parts,
+                "initialization": initialization_metadata,
                 "train_config_path": str(config.__config_path__),
                 "train_config": train_config_snapshot,
                 "dataset_root": str(dataset_root),
@@ -531,12 +1176,24 @@ def main(args):
             }, best_model_path)
             # 即使在 MIN_EPOCHS 内，也保存更好的模型
         else:
+            if (
+                capabilities["subtype"]
+                and best_candidate is not None
+                and not best_candidate.constraints_met
+            ):
+                # 在尚未出现满足全部约束的候选前，不因 fallback 指标停训。
+                patience_counter = 0
+                continue
             # 只有当超过最小训练轮数后，才开始消耗耐心
             if epoch > MIN_EPOCHS:
                 patience_counter += 1
                 if patience_counter >= PATIENCE:
-                    print(f"\n[Early Stopping] Fold {current_fold} at epoch {epoch}. "
-                          f"Best Val F1: {best_val_f1:.4f} (Ep {best_epoch})")
+                    print(
+                        f"\n[Early Stopping] Fold {current_fold} at epoch {epoch}. "
+                        f"Best {best_candidate.primary_metric_name}: "
+                        f"{best_candidate.primary_metric_value:.4f} "
+                        f"(Ep {best_epoch})"
+                    )
                     break
             else:
                 # 保护期内，重置耐心，确保出了保护期是满血状态
@@ -562,9 +1219,29 @@ if __name__ == "__main__":
         required=True,
         help="Training output root; weights are written to OUTPUT_ROOT/checkpoints",
     )
+    parser.add_argument(
+        "--init-checkpoint-root",
+        default=None,
+        help=(
+            "Optional baseline experiment root (or its checkpoints directory). "
+            "The matching sequence/fold checkpoint initializes shared weights."
+        ),
+    )
     # [修改] required=False 表示如果命令行不打 --seq 就是多通道
-    parser.add_argument("--seq", type=int, required=False, default=None, help="Sequence ID (1-3). Leave empty for ALL channels.")
-    parser.add_argument("--model", type=str, required=True, choices=["cnn3d", "ResNet", "ResNet18", "FoundationModel", "FoundationModel_ori"])
+    parser.add_argument(
+        "--seq",
+        type=int,
+        choices=range(1, len(ALL_SEQUENCES) + 1),
+        required=False,
+        default=None,
+        help="Sequence ID (1-3). Leave empty for ALL channels.",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        required=True,
+        choices=MODEL_CHOICES,
+    )
     parser.add_argument("--fold", type=int, required=True, choices=range(1, K_FOLDS + 1), help=f"Fold ID (1-{K_FOLDS})")
     args = parser.parse_args()
     

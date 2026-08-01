@@ -4,6 +4,11 @@ import torch.nn.functional as F
 
 
 class Simple3DCNN(nn.Module):
+    has_classification_head = True
+    has_subtype_head = False
+    has_segmentation_head = False
+    uses_capability_interface = False
+
     def __init__(self, num_classes=2):
         super().__init__()
 

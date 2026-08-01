@@ -17,6 +17,11 @@ class FoundationModel(nn.Module):
     - classification head: 将特征图池化后，进行全局病种三分类
     - segmentation head: 基于同一个特征图，输出像素级病灶 Mask
     """
+    has_classification_head = True
+    has_subtype_head = False
+    has_segmentation_head = True
+    uses_capability_interface = True
+
     def __init__(
         self,
         num_classes: int = 3,
@@ -137,7 +142,16 @@ class FoundationModel(nn.Module):
         spatial_feat = self.backbone(x)   
         return spatial_feat
 
-    def forward(self, x, return_seg=False):
+    def forward(
+        self,
+        x,
+        return_seg=False,
+        return_subtype=False,
+        return_dict=False,
+    ):
+        if return_subtype:
+            raise ValueError("FoundationModel does not have a subtype head")
+
         # 1. 提取具有空间维度的深层特征
         spatial_feat = self.forward_features(x)
         
@@ -148,6 +162,7 @@ class FoundationModel(nn.Module):
         cls_logits = self.head(feat)
         
         # 3. 分割分支（开启 return_seg 时才会发生计算，节约普通推理期间的开销）
+        seg_logits = None
         if return_seg:
             seg_features = self.aux_heads["seg_head"](spatial_feat)
             
@@ -159,6 +174,11 @@ class FoundationModel(nn.Module):
                 mode='trilinear', 
                 align_corners=False
             )
+        if return_dict:
+            outputs = {"classification": cls_logits}
+            if seg_logits is not None:
+                outputs["segmentation"] = seg_logits
+            return outputs
+        if return_seg:
             return cls_logits, seg_logits
-            
         return cls_logits
