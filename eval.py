@@ -12,6 +12,7 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from pathlib import Path
 from torch.utils.data import DataLoader, Dataset
 
 from configs.config_utils import (
@@ -29,11 +30,16 @@ from configs.global_config import (
 )
 
 from models.model_factory import (
+    MODEL_CHOICES,
     create_model,
     forward_model,
     model_capabilities,
 )
 from utils.train_and_test import set_seed, load_pt_dataset
+from utils.fusion_diagnostics import (
+    save_probability_diagnostics,
+    write_probability_diagnostics_readme,
+)
 
 import warnings
 warnings.filterwarnings(
@@ -76,6 +82,72 @@ class MultiSequenceDataset(Dataset):
 # ================================================
 
 
+def resolve_fusion_models(model_set, explicit_model_names):
+    """解析三个序列实际使用的模型，并标记旧层级融合模式。"""
+    if explicit_model_names is not None:
+        return (
+            tuple(explicit_model_names),
+            "Custom Heterogeneous Soft Voting",
+            False,
+        )
+    if model_set == "hierarchical":
+        return (
+            ("FoundationModelHierarchical",) * len(ALL_SEQUENCES),
+            "Hierarchical Late Fusion",
+            True,
+        )
+    return (
+        (
+            "FoundationModel_ori",
+            "FoundationModel_ori",
+            "FoundationModel",
+        ),
+        "Baseline Heterogeneous Soft Voting",
+        False,
+    )
+
+
+def resolve_checkpoint_roots(shared_root, sequence_roots):
+    """支持一个共享实验根，或按 seq1/seq2/seq3 分别指定实验根。"""
+    if shared_root is not None and sequence_roots is not None:
+        raise ValueError(
+            "Specify either --checkpoint-root or --checkpoint-roots, not both"
+        )
+    if sequence_roots is not None:
+        if len(sequence_roots) != len(ALL_SEQUENCES):
+            raise ValueError(
+                f"--checkpoint-roots requires {len(ALL_SEQUENCES)} paths"
+            )
+        return tuple(
+            resolve_input_artifact_dir(root, "checkpoints")
+            for root in sequence_roots
+        )
+    if shared_root is None:
+        raise ValueError(
+            "One of --checkpoint-root or --checkpoint-roots is required"
+        )
+    checkpoint_root = resolve_input_artifact_dir(shared_root, "checkpoints")
+    return (checkpoint_root,) * len(ALL_SEQUENCES)
+
+
+def combine_hierarchical_probabilities(
+    classification_probabilities,
+    subtype_probabilities,
+):
+    """把 normal/abnormal 主概率与异常条件概率组成三分类联合概率。"""
+    abnormal_probability = classification_probabilities[:, 1:].sum(
+        dim=1,
+        keepdim=True,
+    )
+    return torch.cat(
+        (
+            classification_probabilities[:, :1],
+            abnormal_probability * subtype_probabilities,
+        ),
+        dim=1,
+    )
+
+
 def evaluate_vote_single_fold(
     fold_idx,
     dataset_dirs,
@@ -84,22 +156,15 @@ def evaluate_vote_single_fold(
     batch_size,
     num_workers,
     device,
-    model_set,
+    model_names,
+    mode_name,
+    use_legacy_hierarchical_fusion,
+    report_root=None,
 ):
     """
     使用三个模型进行软投票的评估函数
     """
     print(f"\n{'='*20} Evaluating Fold {fold_idx} {'='*20}")
-    if model_set == "hierarchical":
-        model_names = ["FoundationModelHierarchical"] * len(ALL_SEQUENCES)
-        mode_name = "Hierarchical Late Fusion"
-    else:
-        model_names = [
-            "FoundationModel_ori",
-            "FoundationModel_ori",
-            "FoundationModel",
-        ]
-        mode_name = "Baseline Heterogeneous Soft Voting"
     print(f"Mode: {mode_name}")
 
     # ---------- 1. 加载数据 ----------
@@ -161,6 +226,9 @@ def evaluate_vote_single_fold(
     all_preds = []
     all_main_preds = []
     all_labels = []
+    all_case_ids = []
+    all_base_probabilities = []
+    all_fusion_probabilities = []
     misclassified_cases = []
 
     # 注意：投票模式下不计算 Loss，因为直接比较概率
@@ -170,6 +238,7 @@ def evaluate_vote_single_fold(
             
             # xs 包含 3 个 batch tensor (T1, T2, FLAIR)
             probs = []
+            main_probs = []
             subtype_probs = []
             for i, x in enumerate(xs):
                 x = x.to(device)
@@ -182,12 +251,19 @@ def evaluate_vote_single_fold(
                 logits = outputs["classification"]
                 
                 # 将 logits 转换为概率分布
-                prob = F.softmax(logits, dim=1)
-                probs.append(prob)
+                main_prob = F.softmax(logits, dim=1)
+                main_probs.append(main_prob)
                 if capabilities["subtype"]:
-                    subtype_probs.append(
-                        F.softmax(outputs["subtype"], dim=1)
+                    subtype_prob = F.softmax(outputs["subtype"], dim=1)
+                    subtype_probs.append(subtype_prob)
+                    probs.append(
+                        combine_hierarchical_probabilities(
+                            main_prob,
+                            subtype_prob,
+                        )
                     )
+                else:
+                    probs.append(main_prob)
             
             # --- 核心：平均概率 (Soft Voting) ---
             # 也可以在这里改成加权平均，例如:
@@ -195,10 +271,16 @@ def evaluate_vote_single_fold(
             avg_prob = (probs[0] + probs[1] + probs[2]) / 3.0
             
             main_preds = avg_prob.argmax(dim=1)
-            if model_set == "hierarchical":
+            if use_legacy_hierarchical_fusion:
+                avg_main_prob = torch.stack(main_probs, dim=0).mean(dim=0)
                 avg_subtype_prob = torch.stack(subtype_probs, dim=0).mean(dim=0)
+                avg_prob = combine_hierarchical_probabilities(
+                    avg_main_prob,
+                    avg_subtype_prob,
+                )
+                main_preds = avg_main_prob.argmax(dim=1)
                 preds = main_preds.clone()
-                abnormal = main_preds != 0
+                abnormal = preds != 0
                 subtype_preds = avg_subtype_prob.argmax(dim=1) + 1
                 preds[abnormal] = subtype_preds[abnormal]
             else:
@@ -211,6 +293,12 @@ def evaluate_vote_single_fold(
             all_preds.extend(preds_cpu)
             all_main_preds.extend(main_preds_cpu)
             all_labels.extend(labels_cpu)
+            all_case_ids.extend(str(case_id) for case_id in case_ids)
+            if report_root is not None:
+                all_base_probabilities.append(
+                    torch.stack(probs, dim=1).cpu().numpy()
+                )
+                all_fusion_probabilities.append(avg_prob.cpu().numpy())
 
             # 收集误判 case
             for cid, p, gt in zip(case_ids, preds_cpu, labels_cpu):
@@ -227,7 +315,7 @@ def evaluate_vote_single_fold(
     recall = recall_score(all_labels, all_preds, average='macro', zero_division=0)
     f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
     cm = confusion_matrix(all_labels, all_preds)
-    if model_set == "hierarchical":
+    if use_legacy_hierarchical_fusion:
         main_acc = accuracy_score(all_labels, all_main_preds)
         main_f1 = f1_score(
             all_labels,
@@ -244,7 +332,7 @@ def evaluate_vote_single_fold(
     print(f"Precision     : {precision:.4f}")
     print(f"Recall        : {recall:.4f}")
     print(f"F1-score      : {f1:.4f}")
-    if model_set == "hierarchical":
+    if use_legacy_hierarchical_fusion:
         print(f"Main-head Acc : {main_acc:.4f}")
         print(f"Main-head F1  : {main_f1:.4f}")
 
@@ -275,13 +363,38 @@ def evaluate_vote_single_fold(
     else:
         print("None")
 
+    diagnostics_data = None
+    if report_root is not None:
+        diagnostics_data = {
+            "case_ids": np.asarray(all_case_ids, dtype=str),
+            "labels": np.asarray(all_labels, dtype=np.int64),
+            "base_probabilities": np.concatenate(
+                all_base_probabilities,
+                axis=0,
+            ),
+            "fusion_probabilities": np.concatenate(
+                all_fusion_probabilities,
+                axis=0,
+            ),
+            "model_names": tuple(model_names),
+        }
+        saved = save_probability_diagnostics(
+            report_root=report_root,
+            fold_idx=fold_idx,
+            **diagnostics_data,
+        )
+        print(f"\nProbability table : {saved['predictions_path']}")
+        print(f"Calibration table : {saved['calibration_path']}")
+        print(f"Diagnostic summary: {saved['summary_path']}")
+
     return {
         "acc": acc,
         "precision": precision,
         "recall": recall,
         "f1": f1,
-        "main_acc": main_acc if model_set == "hierarchical" else acc,
-        "main_f1": main_f1 if model_set == "hierarchical" else f1,
+        "main_acc": main_acc if use_legacy_hierarchical_fusion else acc,
+        "main_f1": main_f1 if use_legacy_hierarchical_fusion else f1,
+        "diagnostics_data": diagnostics_data,
     }
 
 
@@ -289,23 +402,53 @@ def evaluate_vote_single_fold(
 def main(args):
     config = load_python_config(args.config, TRAIN_CONFIG_FIELDS)
     dataset_root = resolve_input_artifact_dir(args.data_root, "datasets")
-    ckpt_root = resolve_input_artifact_dir(args.checkpoint_root, "checkpoints")
+    checkpoint_roots = resolve_checkpoint_roots(
+        args.checkpoint_root,
+        args.checkpoint_roots,
+    )
+    (
+        model_names,
+        mode_name,
+        use_legacy_hierarchical_fusion,
+    ) = resolve_fusion_models(args.model_set, args.model_names)
     processed_data_root = infer_data_dir(args.data_root)
+    report_root = (
+        Path(args.report_root).expanduser().resolve()
+        if args.report_root is not None
+        else None
+    )
+    if report_root is not None and use_legacy_hierarchical_fusion:
+        raise ValueError(
+            "Probability diagnostics do not support the legacy hard-gated "
+            "hierarchical fusion mode; use explicit --model-names to evaluate "
+            "joint three-class probabilities"
+        )
     dataset_dirs = [
         dataset_root / f"seq{seq_id}_{seq_name}"
         for seq_id, seq_name in enumerate(ALL_SEQUENCES, start=1)
     ]
     ckpt_dirs = [
-        ckpt_root / f"seq{seq_id}_{seq_name}"
+        checkpoint_roots[seq_id - 1] / f"seq{seq_id}_{seq_name}"
         for seq_id, seq_name in enumerate(ALL_SEQUENCES, start=1)
     ]
 
     set_seed(SEED)
 
-    print(f"\n>>> Starting K-Fold Evaluation for: {args.model_set} fusion <<<")
+    print(f"\n>>> Starting K-Fold Evaluation for: {mode_name} <<<")
     print(f"Evaluation config: {config.__config_path__}")
     print(f"Dataset input   : {dataset_root}")
-    print(f"Checkpoint input: {ckpt_root}")
+    for seq_idx, (seq_name, model_name, checkpoint_root) in enumerate(
+        zip(ALL_SEQUENCES, model_names, checkpoint_roots),
+        start=1,
+    ):
+        print(
+            f"Seq{seq_idx} {seq_name:<5}: {model_name} | "
+            f"{checkpoint_root}"
+        )
+    if report_root is not None:
+        readme_path = write_probability_diagnostics_readme(report_root)
+        print(f"Report output   : {report_root}")
+        print(f"Report guide    : {readme_path}")
 
     if args.fold is not None:
         folds_to_run = [args.fold]
@@ -325,7 +468,12 @@ def main(args):
             batch_size=config.BATCH_SIZE,
             num_workers=config.NUM_WORKERS,
             device=config.DEVICE,
-            model_set=args.model_set,
+            model_names=model_names,
+            mode_name=mode_name,
+            use_legacy_hierarchical_fusion=(
+                use_legacy_hierarchical_fusion
+            ),
+            report_root=report_root,
         )
         if res:
             metrics_history.append(res)
@@ -348,12 +496,11 @@ def main(args):
         avg_rec = np.mean([r['recall'] for r in metrics_history])
         std_rec = np.std([r['recall'] for r in metrics_history])
 
-        if args.model_set == "hierarchical":
+        if use_legacy_hierarchical_fusion:
             print("Method        : Hierarchical Late Fusion")
-            print("Models        : All sequences=FoundationModelHierarchical")
         else:
-            print("Method        : Late Fusion Soft Voting (Heterogeneous Ensemble)")
-            print("Models        : Seq1/Seq2=FoundationModel_ori, Seq3=FoundationModel")
+            print(f"Method        : {mode_name}")
+        print(f"Models        : {', '.join(model_names)}")
         print("-" * 40)
         print(f"{'Metric':<15} | {'Mean':<10} | {'Std':<10}")
         print("-" * 40)
@@ -361,7 +508,7 @@ def main(args):
         print(f"{'Precision':<15} | {avg_prec:.4f}     | ±{std_prec:.4f}")
         print(f"{'Recall':<15} | {avg_rec:.4f}     | ±{std_rec:.4f}")
         print(f"{'F1-Score':<15} | {avg_f1:.4f}     | ±{std_f1:.4f}")
-        if args.model_set == "hierarchical":
+        if use_legacy_hierarchical_fusion:
             avg_main_acc = np.mean([r["main_acc"] for r in metrics_history])
             avg_main_f1 = np.mean([r["main_f1"] for r in metrics_history])
             print(f"{'Main-head Acc':<15} | {avg_main_acc:.4f}     |")
@@ -369,6 +516,34 @@ def main(args):
         print("-" * 40)
     elif len(metrics_history) == 0:
         print("\n[Error] No folds were successfully evaluated.")
+
+    if report_root is not None and metrics_history:
+        diagnostic_results = [
+            result["diagnostics_data"]
+            for result in metrics_history
+            if result["diagnostics_data"] is not None
+        ]
+        pooled = save_probability_diagnostics(
+            report_root=report_root,
+            case_ids=np.concatenate(
+                [result["case_ids"] for result in diagnostic_results]
+            ),
+            labels=np.concatenate(
+                [result["labels"] for result in diagnostic_results]
+            ),
+            base_probabilities=np.concatenate(
+                [result["base_probabilities"] for result in diagnostic_results],
+                axis=0,
+            ),
+            fusion_probabilities=np.concatenate(
+                [result["fusion_probabilities"] for result in diagnostic_results],
+                axis=0,
+            ),
+            model_names=diagnostic_results[0]["model_names"],
+        )
+        print(f"\nPooled probability table : {pooled['predictions_path']}")
+        print(f"Pooled calibration table : {pooled['calibration_path']}")
+        print(f"Pooled diagnostic summary: {pooled['summary_path']}")
 
 
 # ================== CLI ==================
@@ -386,8 +561,18 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--checkpoint-root",
-        required=True,
+        default=None,
         help="Training output root containing checkpoints, or checkpoints itself",
+    )
+    parser.add_argument(
+        "--checkpoint-roots",
+        nargs=len(ALL_SEQUENCES),
+        metavar=("SEQ1_ROOT", "SEQ2_ROOT", "SEQ3_ROOT"),
+        default=None,
+        help=(
+            "Per-sequence training roots (or checkpoints directories). Mutually "
+            "exclusive with --checkpoint-root."
+        ),
     )
     parser.add_argument(
         "--fold",
@@ -403,6 +588,25 @@ if __name__ == "__main__":
         help=(
             "baseline keeps the existing heterogeneous ensemble; hierarchical "
             "uses FoundationModelHierarchical for all three sequences"
+        ),
+    )
+    parser.add_argument(
+        "--model-names",
+        nargs=len(ALL_SEQUENCES),
+        choices=MODEL_CHOICES,
+        metavar=("SEQ1_MODEL", "SEQ2_MODEL", "SEQ3_MODEL"),
+        default=None,
+        help=(
+            "Explicit model class for each sequence. When supplied, this overrides "
+            "the model names implied by --model-set and enables mixed model sets."
+        ),
+    )
+    parser.add_argument(
+        "--report-root",
+        default=None,
+        help=(
+            "Optional directory for per-case probability, calibration, and soft-vote "
+            "diagnostic tables."
         ),
     )
     args = parser.parse_args()
