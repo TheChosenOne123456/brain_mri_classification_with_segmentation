@@ -81,7 +81,7 @@
 
 项目主要子文件和子文件夹意义如下：
 1. configs：`global_config.py` 只保存类别、序列、随机种子、K-Fold 和原始数据路径等跨阶段设置；`config_utils.py` 负责加载实验目录中的阶段配置并解析标准产物目录
-2. models：模型的实现，其中`FoundationModel_ori.py`用于seq1/seq2纯分类模型，`FoundationModel.py`用于seq3带分割头的多任务模型；`FoundationModelHierarchical.py`是主三分类头+异常子类头+可选分割头的层级实验模型，`FoundationModelLesionAwareHierarchical.py`是使用分割 soft attention 汇聚病灶空间特征的 FLAIR 专用层级模型，`model_factory.py`统一模型注册、能力判断与前向输出
+2. models：模型的实现，其中`FoundationModel_ori.py`用于seq1/seq2纯分类模型，`FoundationModel.py`用于seq3带分割头的多任务模型；`FoundationModelHierarchical.py`是主三分类头+异常子类头+可选分割头的层级实验模型，`FoundationModelLesionAwareHierarchical.py`是使用分割 soft attention 汇聚病灶空间特征的 FLAIR 专用层级模型，`FLAIRUNet3D.py`是各向异性 3D U-Net 分割与全局/病灶双路分类模型，`model_factory.py`统一模型注册、能力判断与前向输出
 3. utils：一些工具的实现
 4. scripts：必要的脚本实现，包含“数据预处理”“mask预处理”和“训练集、验证集和测试集的生成”
 5. train_kfold.py：训练脚本，配合k折交叉验证使用
@@ -336,6 +336,174 @@ python train_kfold.py \
 最高的 epoch。测试集不参与训练、早停、阈值或 checkpoint 选择。
 
 `CLASSIFICATION_LOSS` 可设为 `weighted_cross_entropy`（当前默认逻辑）、`cross_entropy` 或 `class_balanced_focal`。迁移后的历史 `.pt` 仍保存了原 `version1/data/...` 路径，但加载器会根据 `--data-root output/data-hdbet` 自动重定位到新的 `data/`。
+
+### FLAIR 3D U-Net 分阶段实验
+
+`FLAIRUNet3D` 用于验证“先学会定位，再让定位辅助分类”的路线。它与历史
+`FoundationModel` 的主要差别是：
+
+1. 使用四级 U-Net decoder，每一级都通过转置卷积上采样并连接对应 encoder skip；
+2. 根据当前 `(3.0, 0.75, 0.75) mm` spacing，前两级使用 `(1,3,3)` 卷积和
+   `(1,2,2)` 下采样，平面 spacing 接近层厚后才沿 Z 轴下采样；
+3. decoder 提供三个由低到高分辨率的 deep-supervision 输出；
+4. 分割目标是单通道二值 lesion mask。医生 mask 实际只表达病灶区域，不再用病例级
+   inflammation/metastasis 标签人为制造三类分割目标；
+5. 分类头拼接 bottleneck 全局池化特征与预测 soft lesion mask 引导的最高分辨率
+   decoder 特征，分割不完美时仍保留全脑上下文。
+
+现有 `train_kfold.py` 的单优化器、三类 voxel CE 和按分类分布采样不适合这个实验，
+因此使用独立入口 `train_flair_unet.py`。三个阶段都只使用对应 fold 的 train/validation；
+test 不参与 checkpoint、阈值或超参数选择。阶段一会自动排除“异常但无可靠 mask”的病例，
+保留所有有医生 mask 的异常病例和正常全零 mask 病例。当前 Fold 1 train 中二者是
+543:248，约为 2.19:1，无需为了得到 2:1 再重复采样。
+
+先只跑 Fold 1 的阶段一，确认 positive-case Dice、病灶体素 recall 和正常病例假阳性体素
+比例是否合理：
+
+```bash
+python train_flair_unet.py \
+    --config output/runs-flair-unet-segmentation/train_config.py \
+    --data-root output/data-hdbet \
+    --output-root output/runs-flair-unet-segmentation \
+    --stage segmentation \
+    --fold 1
+```
+
+这是全体积 `(48,320,320)` 3D U-Net 训练，默认 batch size 为 1，属于长任务，单折通常
+需要数小时而不是几分钟。开始正式五折前应先观察 Fold 1 的显存和单 epoch 时间；如果首个
+epoch 15～20 分钟仍没有任何 batch 进度，再检查数据读取或显存问题。不要直接改回历史
+batch size 8。
+
+阶段一稳定后，再依次运行分类头热身和联合微调：
+
+```bash
+python train_flair_unet.py \
+    --config output/runs-flair-unet-classification-warmup/train_config.py \
+    --data-root output/data-hdbet \
+    --output-root output/runs-flair-unet-classification-warmup \
+    --init-checkpoint-root output/runs-flair-unet-segmentation \
+    --stage classification-warmup \
+    --fold 1
+
+python train_flair_unet.py \
+    --config output/runs-flair-unet-joint/train_config.py \
+    --data-root output/data-hdbet \
+    --output-root output/runs-flair-unet-joint \
+    --init-checkpoint-root output/runs-flair-unet-classification-warmup \
+    --stage joint \
+    --fold 1
+```
+
+联合阶段默认使用 `encoder/decoder lr=1e-5`、`classification lr=1e-4`，并持续保留
+二值 BCE + soft Dice 分割损失。正式联合训练前，建议将
+`CHECKPOINT_MIN_POSITIVE_DICE` 设置为阶段一该 fold 最佳 validation positive-case Dice
+的 90%～95%；选择 checkpoint 时先满足该分割约束、validation accuracy 和 metastasis
+precision 约束，再最大化 validation metastasis F2（均可在阶段配置中调整）。阶段一的分割
+约束应只根据下述五折 validation 诊断设置，不应使用内部 test 选择这些值。
+
+单序列评估兼容单通道二值分割输出，并额外报告 masked abnormal cases 的
+`Positive Lesion Dice`：
+
+```bash
+python eval_kfold.py \
+    --config output/runs-flair-unet-joint/train_config.py \
+    --data-root output/data-hdbet \
+    --checkpoint-root output/runs-flair-unet-joint \
+    --seq 3 --model FLAIRUNet3D --fold 1 \
+    --batch-size 1
+```
+
+阶段一五折完成后，使用 validation-only 诊断脚本扫描分割概率阈值，并输出逐病例
+Dice/precision/recall、正常病例假阳性体积、完全漏检率、病灶体积分层以及最佳/最差病例
+叠加图。该脚本不会读取 test：
+
+```bash
+python analyze_flair_unet_segmentation.py \
+    --config output/runs-flair-unet-segmentation/train_config.py \
+    --data-root output/data-hdbet \
+    --checkpoint-root output/runs-flair-unet-segmentation \
+    --device cuda:0 --batch-size 1 --num-workers 8
+```
+
+默认报告写入
+`output/runs-flair-unet-segmentation/reports/validation_segmentation_analysis/`。阈值推荐以
+0.5 为基线，在“不增加正常病例平均假阳性体积”的候选中最大化 positive-case mean
+Dice；任何阈值或后续超参数判断都只使用 validation 结果。
+
+针对正常病例长尾假阳性，可运行保持采样和 deep supervision 不变的 loss-only
+对照实验。该配置把阳性病例 BCE 分成正体素与 top 0.2% 难负体素分别归一化；正常
+全零 mask 使用 dense BCE 与难负体素 BCE 的等权组合，并跳过 empty-target Dice：
+
+```bash
+python train_flair_unet.py \
+    --config output/runs-flair-unet-segmentation-hard-negative/train_config.py \
+    --data-root output/data-hdbet \
+    --output-root output/runs-flair-unet-segmentation-hard-negative \
+    --stage segmentation \
+    --fold 1
+```
+
+先只运行 Fold 1，并固定 `0.5` 阈值与原阶段一 Fold 1 比较 positive Dice、precision、
+recall、normal mean/P95 FP volume。训练完成后可将上述实验根传给
+`analyze_flair_unet_segmentation.py --folds 1` 生成相同口径的 validation 报告。
+
+#### nnU-Net 风格 FLAIR U-Net
+
+独立 nnU-Net Dataset501 的 Fold 1 final checkpoint 在相同 132 个 validation 病例上，
+项目口径的 positive-case mean Dice/precision/recall 为
+`0.3682/0.4421/0.4036`，完全漏检率为 `7.95%`；44 个正常病例的 mean/P95 FP
+体积为 `1.40/4.56 mL`。nnU-Net 终端的 `Mean Validation Dice=0.3411` 还会把产生
+假阳性的正常病例按 Dice 0 纳入均值，因此不对应项目一直报告的
+`positive_dice`；新训练日志将这个官方混合口径单列为
+`nnunet_foreground_dice`，并继续用前述拆分指标解释模型表现。
+
+`FLAIRUNet3DNNUNet` 在保留全局/soft-mask 局部双路分类接口的前提下复现该成功设置：
+
+1. 六级 `32/64/128/256/320/320` PlainConvUNet、strided-conv 下采样、两通道
+   segmentation head；对外返回 lesion/background logit 差，因此仍兼容现有单通道
+   二值分割接口；
+2. `(40,224,192)` patch、global batch 2、每 epoch 250 次更新和约 50% 的实际强制
+   前景 patch（batch 2 下由 nnU-Net 的 0.33 规则取整得到）；
+3. dense CE 等价 BCE + foreground soft Dice、nnU-Net deep-supervision 权重；
+4. SGD Nesterov、初始学习率 `0.01`、momentum `0.99`、poly schedule、梯度裁剪 12；
+5. 与各向异性计划一致的平面旋转/缩放、噪声、模糊、亮度、对比度、低分辨率、
+   gamma 和三轴镜像增强；整例非零脑区 Z-score 保持训练/验证一致，validation 使用
+   非零区域裁剪、Gaussian sliding window 和 mirroring。
+
+已经训练完成的 nnU-Net final 不需要丢弃。先把它逐层转换到项目模型；这是很快的
+CPU 操作，只搬运同构 encoder、decoder 和 segmentation heads，随机初始化的分类分支
+不会冒充分割权重：
+
+```bash
+python -m scripts.convert_nnunet_flair_checkpoint --nnunet-checkpoint output/nnunet-flair/nnUNet_results/Dataset501_FLAIRLesion/nnUNetTrainer__nnUNetPlans__3d_fullres/fold_0/checkpoint_final_original_1000.pth --output-root output/runs-flair-unet-nnunet-imported --fold 1
+```
+
+随后用下文的分析命令，将 `--checkpoint-root` 改成
+`output/runs-flair-unet-nnunet-imported`，先确认项目接口下的指标。转换结果可直接作为
+后续 classification-warmup 的阶段一初始化；报告中的
+`baseline_meets_config_reference` 按固定阈值 `0.5` 判断是否达到原生 final，原生
+nnU-Net 权重本身不会被修改。
+
+先只训练 Fold 1。该配置与 nnU-Net 一样是约 1000 epoch 的长任务；使用两张 GPU，
+每张卡一个 patch，不要为了占满八张卡改变 global batch 和优化轨迹：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python train_flair_unet.py --config output/runs-flair-unet-nnunet-style/train_config.py --data-root output/data-hdbet --output-root output/runs-flair-unet-nnunet-style --stage segmentation --fold 1
+```
+
+每次完整 validation 后都会保存 `latest` 训练状态；中断后在同一命令末尾加入
+`--resume`。不加 `--resume` 时若该 fold 已有 checkpoint，脚本会直接拒绝覆盖。
+
+训练中每 25 epoch 才进行一次完整 sliding-window validation。checkpoint 先要求
+positive Dice/precision/recall、漏检率和正常 mean FP 达到配置中的约束，再按
+positive-case Dice 选择；每次验证输出的 `nnunet_reference_met` 只有在官方混合 Dice
+和六项拆分指标都达到
+本次 nnU-Net final 的同口径数值时才为 `true`。test 不参与选择。训练完成后按相同推理
+方式生成逐病例报告：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python analyze_flair_unet_segmentation.py --config output/runs-flair-unet-nnunet-style/train_config.py --data-root output/data-hdbet --checkpoint-root output/runs-flair-unet-nnunet-style --folds 1 --device cuda:0 --batch-size 1 --num-workers 8
+```
 
 ### 模型测试
 模型测试的核心评估指标有这些：

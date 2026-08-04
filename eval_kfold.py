@@ -32,7 +32,6 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
 from configs.config_utils import (
-    TRAIN_CONFIG_FIELDS,
     infer_data_dir,
     load_python_config,
     resolve_input_artifact_dir,
@@ -54,6 +53,10 @@ from models.model_factory import (
     model_capabilities,
 )
 from utils.train_and_test import set_seed, load_pt_dataset
+from utils.segmentation import (
+    binary_dice_per_sample,
+    binary_lesion_predictions,
+)
 
 import warnings
 warnings.filterwarnings(
@@ -69,6 +72,9 @@ from sklearn.metrics import (
     confusion_matrix,
     classification_report,
 )
+
+
+EVAL_RUNTIME_CONFIG_FIELDS = ("BATCH_SIZE", "DEVICE", "NUM_WORKERS")
 
 
 # ================== [新增专区：Dice 计算] ==================
@@ -283,6 +289,7 @@ def evaluate_single_fold(args_seq, model_name, fold_idx):
     total_loss = 0.0
     
     valid_seg_dices = []
+    positive_lesion_dices = []
     misclassified_cases = []
 
     with torch.no_grad():
@@ -324,13 +331,24 @@ def evaluate_single_fold(args_seq, model_name, fold_idx):
             
             # --- 收集分割 Dice (若存在) ---
             if seg_logits is not None and has_seg_data:
-                pred_masks = seg_logits.argmax(dim=1)
-                
                 # 自动解除多余的维度，比如 [B, 1, D, H, W] -> [B, D, H, W]
                 if masks.dim() == 5 and masks.size(1) == 1:
                     masks = masks.squeeze(1)
-                
-                batch_dices = compute_dice(pred_masks, masks, num_classes=NUM_CLASSES)
+
+                if seg_logits.size(1) == 1:
+                    pred_masks = binary_lesion_predictions(seg_logits)
+                    batch_dices = binary_dice_per_sample(pred_masks, masks)
+                else:
+                    pred_masks = seg_logits.argmax(dim=1)
+                    batch_dices = compute_dice(
+                        pred_masks,
+                        masks,
+                        num_classes=NUM_CLASSES,
+                    )
+                batch_binary_dices = binary_dice_per_sample(
+                    pred_masks > 0,
+                    masks > 0,
+                )
                 
                 for i in range(len(case_ids)):
                     y_cls = int(y[i])
@@ -338,6 +356,10 @@ def evaluate_single_fold(args_seq, model_name, fold_idx):
                     # 包含专家标注 Mask 的患者，或是本身健康的患者（天然全零Mask）
                     if h_m or (y_cls == 0):
                         valid_seg_dices.append(batch_dices[i].item())
+                    if h_m and y_cls > 0:
+                        positive_lesion_dices.append(
+                            batch_binary_dices[i].item()
+                        )
 
             preds_cpu = preds.cpu().numpy()
             main_preds_cpu = main_preds.cpu().numpy()
@@ -358,6 +380,11 @@ def evaluate_single_fold(args_seq, model_name, fold_idx):
 
     avg_loss = total_loss / len(test_loader)
     avg_dice = np.mean(valid_seg_dices) if len(valid_seg_dices) > 0 else 0.0
+    avg_positive_lesion_dice = (
+        np.mean(positive_lesion_dices)
+        if len(positive_lesion_dices) > 0
+        else 0.0
+    )
 
     # ---------- 计算指标 ----------
     metrics = calculate_classification_metrics(all_labels, all_preds)
@@ -386,6 +413,12 @@ def evaluate_single_fold(args_seq, model_name, fold_idx):
         print(f"F1-score      : {metrics['f1']:.4f}")
     if len(valid_seg_dices) > 0:
         print(f"Seg Dice      : {avg_dice:.4f}  (Evaluated on {len(valid_seg_dices)} samples)")
+    if len(positive_lesion_dices) > 0:
+        print(
+            "Positive Lesion Dice: "
+            f"{avg_positive_lesion_dice:.4f}  "
+            f"(Evaluated on {len(positive_lesion_dices)} masked abnormal samples)"
+        )
 
     if not capabilities["subtype"]:
         print("\nConfusion Matrix:")
@@ -424,14 +457,15 @@ def evaluate_single_fold(args_seq, model_name, fold_idx):
         "main_f1": main_metrics["f1"],
         "has_subtype": capabilities["subtype"],
         "loss": avg_loss,
-        "dice": avg_dice
+        "dice": avg_dice,
+        "positive_lesion_dice": avg_positive_lesion_dice,
     }
 
 
 # ================== 主流程 ==================
 def main(args):
-    config = load_python_config(args.config, TRAIN_CONFIG_FIELDS)
-    for name in TRAIN_CONFIG_FIELDS:
+    config = load_python_config(args.config, EVAL_RUNTIME_CONFIG_FIELDS)
+    for name in EVAL_RUNTIME_CONFIG_FIELDS:
         globals()[name] = getattr(config, name)
     if args.device is not None:
         globals()["DEVICE"] = args.device
@@ -520,6 +554,16 @@ def main(args):
             print(f"{'Main-head F1':<15} | {avg_main_f1:.4f}     |")
         if has_dice:
             print(f"{'Seg Dice':<15} | {avg_dice:.4f}     | ±{std_dice:.4f}")
+        positive_dices = [
+            r["positive_lesion_dice"]
+            for r in metrics_history
+            if r["positive_lesion_dice"] > 0
+        ]
+        if positive_dices:
+            print(
+                f"{'Positive Dice':<15} | {np.mean(positive_dices):.4f}     | "
+                f"±{np.std(positive_dices):.4f}"
+            )
         print("-" * 40)
     elif len(metrics_history) == 0:
         print("\n[Error] No folds were successfully evaluated.")

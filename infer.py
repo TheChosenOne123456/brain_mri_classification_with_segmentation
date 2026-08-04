@@ -231,9 +231,19 @@ def main(args):
                         F.softmax(outputs["subtype"], dim=1).cpu().numpy()[0]
                     )
                 if capabilities["segmentation"]:
-                    seq3_mask_fold = (
-                        outputs["segmentation"].argmax(dim=1).cpu().numpy()[0]
-                    )
+                    segmentation_logits = outputs["segmentation"]
+                    if segmentation_logits.size(1) == 1:
+                        seq3_mask_fold = (
+                            torch.sigmoid(segmentation_logits)
+                            .ge(0.5)
+                            .squeeze(1)
+                            .cpu()
+                            .numpy()[0]
+                        )
+                    else:
+                        seq3_mask_fold = (
+                            segmentation_logits.argmax(dim=1).cpu().numpy()[0]
+                        )
 
                 fold_probs[seq_idx] = prob_np
 
@@ -344,7 +354,7 @@ def main(args):
         
         # 遍历所有可能的标签值 (背景 0, 炎症 1, 转移瘤 2 等)
         # 求包含像素最多的那个类别作为这个像素点的最终分类
-        for label_val in range(NUM_CLASSES): # 也可以换成从stacked里找unique
+        for label_val in np.unique(stacked_masks):
             # 统计有多少个 Fold 把这个像素指派给了 label_val
             votes_for_label = np.sum(stacked_masks == label_val, axis=0)
             # 如果支持这个 label 的 fold 数量超过了半数，就把对应像素赋值过去 

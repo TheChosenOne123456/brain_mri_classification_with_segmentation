@@ -558,6 +558,12 @@ def model_part_has_trainable_parameters(model, part_name):
 
 def main(args):
     model_name = args.model
+    if model_name == "FLAIRUNet3D":
+        raise ValueError(
+            "FLAIRUNet3D uses binary lesion masks, deep supervision, staged "
+            "freezing, and parameter-group learning rates. Train it with "
+            "train_flair_unet.py instead of train_kfold.py."
+        )
     train_config_fields = (
         TRAIN_CONFIG_FIELDS + required_train_config_fields(model_name)
     )
