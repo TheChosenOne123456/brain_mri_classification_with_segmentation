@@ -357,6 +357,14 @@ test 不参与 checkpoint、阈值或超参数选择。阶段一会自动排除�
 保留所有有医生 mask 的异常病例和正常全零 mask 病例。当前 Fold 1 train 中二者是
 543:248，约为 2.19:1，无需为了得到 2:1 再重复采样。
 
+当前保留的相关实验根：
+
+| 实验根 | 模型与阶段 | 状态 |
+| --- | --- | --- |
+| `output/runs-flair-unet-segmentation` | 原始 `FLAIRUNet3D`，阶段一：从头训练分割 | 5 折完整，作为结构/训练基线 |
+| `output/runs-flair-unet-nnunet-segmentation` | `FLAIRUNet3DNNUNet`，阶段一：导入 nnU-Net Fold 1 epoch-877 best | 当前有效分割初始化，含正确 validation 报告 |
+| `output/runs-foundation-nnunet-guided` | 冻结 Foundation 分类器 + OOF nnU-Net soft-mask subtype expert | 五折完成；锁定 test 显示为召回优先的小幅有效改进 |
+
 先只跑 Fold 1 的阶段一，确认 positive-case Dice、病灶体素 recall 和正常病例假阳性体素
 比例是否合理：
 
@@ -374,44 +382,9 @@ python train_flair_unet.py \
 epoch 15～20 分钟仍没有任何 batch 进度，再检查数据读取或显存问题。不要直接改回历史
 batch size 8。
 
-阶段一稳定后，再依次运行分类头热身和联合微调：
-
-```bash
-python train_flair_unet.py \
-    --config output/runs-flair-unet-classification-warmup/train_config.py \
-    --data-root output/data-hdbet \
-    --output-root output/runs-flair-unet-classification-warmup \
-    --init-checkpoint-root output/runs-flair-unet-segmentation \
-    --stage classification-warmup \
-    --fold 1
-
-python train_flair_unet.py \
-    --config output/runs-flair-unet-joint/train_config.py \
-    --data-root output/data-hdbet \
-    --output-root output/runs-flair-unet-joint \
-    --init-checkpoint-root output/runs-flair-unet-classification-warmup \
-    --stage joint \
-    --fold 1
-```
-
-联合阶段默认使用 `encoder/decoder lr=1e-5`、`classification lr=1e-4`，并持续保留
-二值 BCE + soft Dice 分割损失。正式联合训练前，建议将
-`CHECKPOINT_MIN_POSITIVE_DICE` 设置为阶段一该 fold 最佳 validation positive-case Dice
-的 90%～95%；选择 checkpoint 时先满足该分割约束、validation accuracy 和 metastasis
-precision 约束，再最大化 validation metastasis F2（均可在阶段配置中调整）。阶段一的分割
-约束应只根据下述五折 validation 诊断设置，不应使用内部 test 选择这些值。
-
-单序列评估兼容单通道二值分割输出，并额外报告 masked abnormal cases 的
-`Positive Lesion Dice`：
-
-```bash
-python eval_kfold.py \
-    --config output/runs-flair-unet-joint/train_config.py \
-    --data-root output/data-hdbet \
-    --checkpoint-root output/runs-flair-unet-joint \
-    --seq 3 --model FLAIRUNet3D --fold 1 \
-    --batch-size 1
-```
+原始全体积 U-Net 的阶段二/阶段三从未实际训练，且不适用于当前 patch-based nnU-Net
+骨干，相关空配置已清理。当前先完成下文 nnU-Net 专用阶段二；阶段三联合微调需要在
+阶段二 validation 结果确认后再单独适配。
 
 阶段一五折完成后，使用 validation-only 诊断脚本扫描分割概率阈值，并输出逐病例
 Dice/precision/recall、正常病例假阳性体积、完全漏检率、病灶体积分层以及最佳/最差病例
@@ -430,22 +403,9 @@ python analyze_flair_unet_segmentation.py \
 0.5 为基线，在“不增加正常病例平均假阳性体积”的候选中最大化 positive-case mean
 Dice；任何阈值或后续超参数判断都只使用 validation 结果。
 
-针对正常病例长尾假阳性，可运行保持采样和 deep supervision 不变的 loss-only
-对照实验。该配置把阳性病例 BCE 分成正体素与 top 0.2% 难负体素分别归一化；正常
-全零 mask 使用 dense BCE 与难负体素 BCE 的等权组合，并跳过 empty-target Dice：
-
-```bash
-python train_flair_unet.py \
-    --config output/runs-flair-unet-segmentation-hard-negative/train_config.py \
-    --data-root output/data-hdbet \
-    --output-root output/runs-flair-unet-segmentation-hard-negative \
-    --stage segmentation \
-    --fold 1
-```
-
-先只运行 Fold 1，并固定 `0.5` 阈值与原阶段一 Fold 1 比较 positive Dice、precision、
-recall、normal mean/P95 FP volume。训练完成后可将上述实验根传给
-`analyze_flair_unet_segmentation.py --folds 1` 生成相同口径的 validation 报告。
+Hard-negative BCE + Dice 已完成失败判定并清理：Fold 1/2 的 positive Dice 分别只有
+`0.1710/0.0736`，pooled Dice `0.1185`，明显低于标准 U-Net pooled `0.3527`；该设置
+表现为高 recall、极低 precision，不应按原参数重复训练。
 
 #### nnU-Net 风格 FLAIR U-Net
 
@@ -470,39 +430,70 @@ recall、normal mean/P95 FP volume。训练完成后可将上述实验根传给
    gamma 和三轴镜像增强；整例非零脑区 Z-score 保持训练/验证一致，validation 使用
    非零区域裁剪、Gaussian sliding window 和 mirroring。
 
-已经训练完成的 nnU-Net final 不需要丢弃。先把它逐层转换到项目模型；这是很快的
-CPU 操作，只搬运同构 encoder、decoder 和 segmentation heads，随机初始化的分类分支
-不会冒充分割权重：
+当前有效的阶段一位于 `output/runs-flair-unet-nnunet-segmentation`：它把独立 nnU-Net
+重新训练得到的 Fold 1 epoch-877 best 逐层转换为项目模型，只新增随机初始化的分类分支，
+不会冒充分割权重。decoder 通道顺序修复后，项目 validation 口径的 positive
+Dice/precision/recall 为 `0.3715/0.4484/0.4036`，完全漏检率 `4.55%`，正常病例
+mean/P95 FP 为 `2.50/9.23 mL`。原生 best 仍备份在 `output/nnunet-flair`；旧
+epoch-1000 final 的项目导入副本已经被这个召回更优的 best 取代并清理。
+
+冻结 nnU-Net encoder/decoder 后直接训练三分类头的两轮实验都明显低于 Foundation
+分类基线，相关 warmup 目录已经清理。当前路线改为保留完整 Foundation 分类器，只把
+nnU-Net soft mask 用作多尺度空间先验：对 Foundation layer2/3/4 分别计算全脑池化、
+病灶加权池化和病灶-周边对比池化，再由独立线性 subtype expert 区分 inflammation 与
+metastasis；Foundation 仍负责 normal 门控。目标 fold 的 train 病例按其外层 test fold
+选择从未见过该病例的 nnU-Net，validation/test 使用目标 nnU-Net fold，避免分割特征泄漏。
+
+Fold 1 的 validation 选择在第 1 个 expert epoch 完成；后续离散指标不变而连续 validation
+BCE 恶化，早停在第 5 轮并保留 epoch 1，属于线性 probe 的正常决策平台期。运行五折时，
+脚本会跳过已有 checkpoint，并把 Fold 2–5 分配到四组双卡；影像特征缓存是长任务，线性
+expert 训练本身只需几分钟：
 
 ```bash
-python -m scripts.convert_nnunet_flair_checkpoint --nnunet-checkpoint output/nnunet-flair/nnUNet_results/Dataset501_FLAIRLesion/nnUNetTrainer__nnUNetPlans__3d_fullres/fold_0/checkpoint_final_original_1000.pth --output-root output/runs-flair-unet-nnunet-imported --fold 1
+bash output/runs-foundation-nnunet-guided/train.sh
 ```
 
-随后用下文的分析命令，将 `--checkpoint-root` 改成
-`output/runs-flair-unet-nnunet-imported`，先确认项目接口下的指标。转换结果可直接作为
-后续 classification-warmup 的阶段一初始化；报告中的
-`baseline_meets_config_reference` 按固定阈值 `0.5` 判断是否达到原生 final，原生
-nnU-Net 权重本身不会被修改。
+Fold 1–4 的 validation 均选择了满足保护约束的正 alpha；Fold 5 的病灶 expert 在提高转移
+召回前已经造成过多 inflammation->metastasis 假阳性，因此自动保存 alpha=0 的
+`foundation_fallback`，严格复现该折 Foundation。`best_unconstrained` 只用于说明高召回
+代价，不进入正式评估。以后若其他 fold 也没有安全增益，训练入口会执行相同回退并正常
+结束，而不是令整个五折任务失败。
 
-先只训练 Fold 1。该配置与 nnU-Net 一样是约 1000 epoch 的长任务；使用两张 GPU，
-每张卡一个 patch，不要为了占满八张卡改变 global batch 和优化轨迹：
+五折全部完成后，以下命令只使用 validation 保存的 epoch 和混合系数做一次锁定 test，
+同时比较 FLAIR 单模态和 T1/T2/FLAIR 等权融合的 Foundation 基线与引导版本：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 python train_flair_unet.py --config output/runs-flair-unet-nnunet-style/train_config.py --data-root output/data-hdbet --output-root output/runs-flair-unet-nnunet-style --stage segmentation --fold 1
+bash output/runs-foundation-nnunet-guided/eval.sh
 ```
 
-每次完整 validation 后都会保存 `latest` 训练状态；中断后在同一命令末尾加入
-`--resume`。不加 `--resume` 时若该 fold 已有 checkpoint，脚本会直接拒绝覆盖。
+其中 baseline fusion 严格复用历史 FP32 对照概率：seq1/T1 与 seq2/T2 均为
+`FoundationModel_ori`，seq3/FLAIR 为 `FoundationModel`，三者等权平均；guided fusion
+保持 seq1/seq2 不变，只替换 seq3 的炎症/转移条件概率。不要为 T1/T2 额外启用 FP16
+autocast，它曾导致正常类概率失真并产生约 0.786 的错误融合准确率。修复后的 pooled test
+结果如下。`F2` 是更重视召回率的 F-score（召回权重是精确率的 4 倍）：
 
-训练中每 25 epoch 才进行一次完整 sliding-window validation。checkpoint 先要求
-positive Dice/precision/recall、漏检率和正常 mean FP 达到配置中的约束，再按
-positive-case Dice 选择；每次验证输出的 `nnunet_reference_met` 只有在官方混合 Dice
-和六项拆分指标都达到
-本次 nnU-Net final 的同口径数值时才为 `true`。test 不参与选择。训练完成后按相同推理
-方式生成逐病例报告：
+| 输出 | Accuracy | Macro-F1 | Metastasis P / R / F1 / F2 |
+| --- | ---: | ---: | ---: |
+| Foundation FLAIR | 0.8877 | 0.8491 | 0.7916 / 0.6916 / 0.7382 / 0.7096 |
+| Guided FLAIR | 0.8871 | 0.8506 | 0.7701 / 0.7181 / 0.7432 / 0.7279 |
+| Baseline fusion | 0.9044 | 0.8683 | 0.8727 / 0.6946 / 0.7735 / 0.7241 |
+| Guided fusion | 0.9038 | 0.8683 | 0.8628 / 0.7019 / 0.7741 / 0.7291 |
+
+因此这次实验可列为**成功但幅度有限的召回优先尝试**，不能替代
+`output/runs-cross-entropy` 作为当前可靠综合基线：Guided FLAIR 的转移召回提高
+`2.65` 个百分点，进入三序列融合后仍提高 `0.73` 个百分点，且融合 accuracy 保持在
+预设的 `0.90` 以上。Fold 1–4 的融合转移召回均提高，Fold 5 因 validation 保护约束未
+满足而以 `alpha=0` 回退，结果不变，方向具有跨折一致性。代价是 pooled fusion 多找回
+5 个转移病例的同时，新增 7 个 inflammation->metastasis 假阳性，最终少判对 2/3588
+例，转移 precision 下降 `0.99` 个百分点。它证明 nnU-Net 病灶先验可以把既有分类器推向
+更偏转移召回的工作点，但增量较小，尚不能宣称具有统计或临床显著优势。本次 test 已作为
+锁定开发记录，不再用来修改 epoch、混合系数或选择约束。
+
+阶段一的训练配置已与有效 checkpoint 合并在同一个实验根。不要在该根直接重新启动
+fresh training，以免触发覆盖保护；它主要用于复现实验参数和执行 validation 分析：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python analyze_flair_unet_segmentation.py --config output/runs-flair-unet-nnunet-style/train_config.py --data-root output/data-hdbet --checkpoint-root output/runs-flair-unet-nnunet-style --folds 1 --device cuda:0 --batch-size 1 --num-workers 8
+CUDA_VISIBLE_DEVICES=0 python analyze_flair_unet_segmentation.py --config output/runs-flair-unet-nnunet-segmentation/train_config.py --data-root output/data-hdbet --checkpoint-root output/runs-flair-unet-nnunet-segmentation --folds 1 --device cuda:0 --batch-size 1 --num-workers 8
 ```
 
 ### 模型测试
@@ -631,69 +622,47 @@ python train_meta_fusion.py \
   test     | 58              | 70              | 458             | 159             | 745 
 ```
 
-### 最优模型
+### 当前可靠综合基线
 
-目前在三个序列上分别用“迁移学习”的方式训练单模态模型，其中seq1/seq2采用`FoundationModel_ori`，seq3采用带mask辅助分割头的`FoundationModel`。最优模型是将三个模型的输出软投票，得到的异构多模态晚期融合模型。以下结果已随历史产物迁移到 `output/runs-cross-entropy/output_texts/`：
-
-以下命令行是重构前生成该历史结果时的执行记录；当前 `eval.py` 需要显式配置和路径参数。
+当前默认和可靠综合基线位于 `output/runs-cross-entropy`。seq1/T1、seq2/T2 使用
+`FoundationModel_ori`，seq3/FLAIR 使用带 mask 辅助分割头的 `FoundationModel`，三个
+模型的 FP32 三分类概率等权平均。下面使用当前 `output/data-hdbet` 划分和当前评估入口；
+每个病例只出现在一个 outer test fold 中，五折 pooled 共 3588 例：
 
 ```bash
-(BrainMRIClassification) ailab@ailab:~/projects/brain_mri_classification_with_segmentation$ python eval.py
+python eval.py \
+    --config output/runs-cross-entropy/train_config.py \
+    --data-root output/data-hdbet \
+    --checkpoint-root output/runs-cross-entropy
 ```
 
-| Fold | Test samples | Accuracy | Precision(macro) | Recall(macro) | F1-score(macro) | Metastasis recall |
-|------|--------------|----------|------------------|---------------|-----------------|-------------------|
-| 1 | 746 | 0.9008 | 0.9080 | 0.8291 | 0.8616 | 0.6412 |
-| 2 | 746 | 0.9263 | 0.9042 | 0.8886 | 0.8922 | 0.7143 |
-| 3 | 745 | 0.9168 | 0.9093 | 0.8778 | 0.8916 | 0.7254 |
-| 4 | 745 | 0.9235 | 0.9121 | 0.8698 | 0.8894 | 0.7724 |
-| 5 | 745 | 0.8886 | 0.9041 | 0.8180 | 0.8538 | 0.6415 |
+| Fold | Test samples | Accuracy | Precision (macro) | Recall (macro) | F1 (macro) | Metastasis recall |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 718 | 0.8969 | 0.8934 | 0.8253 | 0.8548 | 0.6912 |
+| 2 | 718 | 0.9123 | 0.9228 | 0.8445 | 0.8766 | 0.6765 |
+| 3 | 718 | 0.9081 | 0.9163 | 0.8433 | 0.8737 | 0.6788 |
+| 4 | 717 | 0.9038 | 0.8892 | 0.8495 | 0.8671 | 0.7132 |
+| 5 | 717 | 0.9010 | 0.8940 | 0.8482 | 0.8691 | 0.7132 |
 
-5折平均结果如下：
+五折指标的 mean ± standard deviation 为：Accuracy `0.9044 ± 0.0053`、Macro-Precision
+`0.9032 ± 0.0137`、Macro-Recall `0.8422 ± 0.0088`、Macro-F1 `0.8683 ± 0.0075`。
+将五个互斥 test fold 的预测合并后，pooled Accuracy/Macro-F1 为 `0.9044/0.8683`，
+metastasis precision/recall/F1/F2 为 `0.8727/0.6946/0.7735/0.7241`。pooled 混淆矩阵
+如下，类别顺序为 `normal`、`inflammation`、`metastasis`：
 
 ```text
-Method        : Late Fusion Soft Voting (Heterogeneous Ensemble)
-Models        : Seq1/Seq2=FoundationModel_ori, Seq3=FoundationModel
-----------------------------------------
-Metric          | Mean       | Std
-----------------------------------------
-Accuracy        | 0.9112     | ±0.0143
-Precision       | 0.9076     | ±0.0031
-Recall          | 0.8567     | ±0.0279
-F1-Score        | 0.8777     | ±0.0166
-----------------------------------------
+[[ 316,   48,   1],
+ [  18, 2456,  68],
+ [   7,  201, 473]]
 ```
 
-各fold混淆矩阵如下，类别顺序为`normal`、`inflammation`、`metastasis`：
-
-```text
-Fold 1:
-[[ 78  11   0]
- [  4 510  12]
- [  0  47  84]]
-
-Fold 2:
-[[ 61   1   0]
- [  7 540  11]
- [  1  35  90]]
-
-Fold 3:
-[[ 67   4   0]
- [  2 513  17]
- [  2  37 103]]
-
-Fold 4:
-[[ 74  10   1]
- [  6 519  12]
- [  0  28  95]]
-
-Fold 5:
-[[ 49   9   0]
- [  1 511  16]
- [  1  56 102]]
-```
-
-从内部测试看，当前异构晚期融合模型的整体准确率和宏平均F1较高，但metastasis recall仍然是瓶颈。五个fold中，脑膜转移的召回率分别是0.6412、0.7143、0.7254、0.7724、0.6415；主要错误仍然是将脑膜转移误判为炎症。
+旧 README 曾记录 `0.9112 ± 0.0143` accuracy，但对应每折 745–746 例、总计 3727 例，
+与当前每折 717–718 例、pooled 3588 例的病例集合并不一致，也不是当前
+`runs-cross-entropy/output_texts/fusion.txt` 的结果。由于旧记录缺少足够的数据版本
+provenance，不能把两个数值当作同一测试集上的模型升降；本节已经用当前产物和统一评估
+口径替换旧表。当前基线的主要瓶颈仍是将 metastasis 判为 inflammation（201 例）。若
+任务更重视转移召回，可并列考虑上一节的 nnU-Net guided fusion，但默认综合模型仍保持
+本基线。
 
 ### 外部验证结果与泛化分析
 

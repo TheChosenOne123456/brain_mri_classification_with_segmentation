@@ -27,6 +27,7 @@ from configs.config_utils import (
     resolve_input_artifact_dir,
 )
 from configs.global_config import CLASS_NAMES, K_FOLDS, NUM_CLASSES, SEED
+from models.FLAIRUNet3D import load_flair_segmentation_state
 from models.model_factory import create_model
 from train_flair_unet import segmentation_supervision_indices
 from utils.segmentation_inference import segmentation_logits_from_config
@@ -87,7 +88,7 @@ def load_model(checkpoint_dir, fold, device, model_name):
         sequence_id=SEQUENCE_ID,
     )
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    model.load_state_dict(checkpoint["model_state"], strict=True)
+    load_flair_segmentation_state(model, checkpoint["model_state"])
     model = model.to(device)
     model.eval()
     return model, checkpoint, path

@@ -27,7 +27,9 @@ from configs.config_utils import (
     resolve_output_artifact_dir,
 )
 from configs.global_config import CLASS_NAMES, K_FOLDS, NUM_CLASSES, SEED
+from models.FLAIRUNet3D import load_flair_segmentation_state
 from models.model_factory import create_model, forward_model, unwrap_model
+from utils.classification_features import cached_feature_loaders
 from utils.segmentation import (
     binary_dice_per_sample,
     binary_lesion_predictions,
@@ -192,6 +194,66 @@ def validate_stage_config(config, stage):
         raise ValueError(
             "Sliding-window validation requires SEG_VALIDATION_ROI_SIZE"
         )
+
+    feature_mode = getattr(config, "CLASSIFICATION_FEATURE_MODE", "direct")
+    if feature_mode not in ("direct", "sliding_cache"):
+        raise ValueError(
+            "CLASSIFICATION_FEATURE_MODE must be direct or sliding_cache"
+        )
+    if feature_mode == "sliding_cache":
+        if stage != "classification-warmup":
+            raise ValueError(
+                "sliding_cache is currently supported only for "
+                "classification-warmup"
+            )
+        if not hasattr(config, "CLASSIFICATION_FEATURE_ROI_SIZE"):
+            raise ValueError(
+                "sliding_cache requires CLASSIFICATION_FEATURE_ROI_SIZE"
+            )
+        feature_roi = tuple(
+            int(value) for value in config.CLASSIFICATION_FEATURE_ROI_SIZE
+        )
+        if len(feature_roi) != 3 or any(value <= 0 for value in feature_roi):
+            raise ValueError(
+                "CLASSIFICATION_FEATURE_ROI_SIZE must contain three positive integers"
+            )
+        feature_overlap = float(
+            getattr(config, "CLASSIFICATION_FEATURE_OVERLAP", 0.5)
+        )
+        if not 0 <= feature_overlap < 1:
+            raise ValueError(
+                "CLASSIFICATION_FEATURE_OVERLAP must lie in [0, 1)"
+            )
+        if int(
+            getattr(config, "CLASSIFICATION_FEATURE_SW_BATCH_SIZE", 1)
+        ) <= 0:
+            raise ValueError(
+                "CLASSIFICATION_FEATURE_SW_BATCH_SIZE must be positive"
+            )
+        if tuple(getattr(config, "CLASSIFICATION_FEATURE_MIRROR_AXES", ())) != ():
+            raise ValueError(
+                "Cached intermediate features do not support mirror TTA; set "
+                "CLASSIFICATION_FEATURE_MIRROR_AXES = ()"
+            )
+        frozen_metric_fields = (
+            "FROZEN_SEGMENTATION_POSITIVE_DICE",
+            "FROZEN_SEGMENTATION_NNUNET_FOREGROUND_DICE",
+            "FROZEN_SEGMENTATION_POSITIVE_PRECISION",
+            "FROZEN_SEGMENTATION_POSITIVE_RECALL",
+            "FROZEN_SEGMENTATION_POSITIVE_MISS_RATE",
+            "FROZEN_SEGMENTATION_NORMAL_MEAN_FP_VOLUME_ML",
+            "FROZEN_SEGMENTATION_NORMAL_P95_FP_VOLUME_ML",
+            "FROZEN_SEGMENTATION_POSITIVE_CASES",
+            "FROZEN_SEGMENTATION_NORMAL_CASES",
+        )
+        missing_frozen_metrics = [
+            name for name in frozen_metric_fields if not hasattr(config, name)
+        ]
+        if missing_frozen_metrics:
+            raise ValueError(
+                "sliding_cache requires the frozen validation metrics: "
+                + ", ".join(missing_frozen_metrics)
+            )
 
 
 def config_snapshot(config):
@@ -481,7 +543,24 @@ def load_initial_checkpoint(
             f"Expected a {expected_source_stage} checkpoint, got {source_stage!r}: "
             f"{checkpoint_path}"
         )
-    model.load_state_dict(checkpoint["model_state"], strict=True)
+    checkpoint_model_name = checkpoint.get("model_name")
+    if checkpoint_model_name not in (None, model_name):
+        raise ValueError(
+            f"Checkpoint model mismatch: {checkpoint_model_name!r} vs "
+            f"{model_name!r}: {checkpoint_path}"
+        )
+    source_state = checkpoint["model_state"]
+    if expected_source_stage == "segmentation":
+        # 阶段一的分类头从未训练，且增强版允许改变分类输入维度。这里只迁移
+        # 分割路径，并严格要求 encoder/decoder/seg head 的键和形状完全一致。
+        loaded_tensor_count = load_flair_segmentation_state(model, source_state)
+        print(
+            "Loaded segmentation backbone: "
+            f"{loaded_tensor_count} tensors; "
+            "classification modules initialized for this stage"
+        )
+    else:
+        model.load_state_dict(source_state, strict=True)
     print(f"Initialized from: {checkpoint_path}")
     return str(checkpoint_path)
 
@@ -628,6 +707,130 @@ def train_one_epoch(
         "loss": total_loss / max(len(loader), 1),
         "accuracy": accuracy_score(targets, predictions),
     }
+
+
+def train_cached_classifier_one_epoch(
+    model,
+    loader,
+    optimizer,
+    scaler,
+    criterion,
+    config,
+    device,
+    fold,
+    epoch,
+):
+    """只对缓存向量运行双路 projection 和 classification head。"""
+    model.train()
+    base_model = unwrap_model(model)
+    total_loss = 0.0
+    sample_count = 0
+    predictions = []
+    targets = []
+    progress = tqdm(loader, desc=f"Fold {fold} Ep {epoch}", leave=False)
+    for global_features, lesion_features, y, _ in progress:
+        global_features = global_features.to(device, non_blocking=True)
+        lesion_features = lesion_features.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        with amp_context(device):
+            logits = base_model.classify_pooled_features(
+                global_features,
+                lesion_features,
+            )
+            classification_loss = criterion(logits, y)
+            loss = float(config.CLASSIFICATION_ALPHA) * classification_loss
+        scaler.scale(loss).backward()
+        gradient_clip_norm = getattr(config, "GRADIENT_CLIP_NORM", None)
+        if gradient_clip_norm is not None:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                base_model.parameters(),
+                float(gradient_clip_norm),
+            )
+        scaler.step(optimizer)
+        scaler.update()
+        batch_size = int(y.size(0))
+        total_loss += float(loss.detach()) * batch_size
+        sample_count += batch_size
+        predictions.extend(logits.argmax(dim=1).detach().cpu().tolist())
+        targets.extend(y.cpu().tolist())
+    return {
+        "loss": total_loss / max(sample_count, 1),
+        "accuracy": accuracy_score(targets, predictions),
+    }
+
+
+def validate_cached_classifier(model, loader, criterion, config, device):
+    model.eval()
+    base_model = unwrap_model(model)
+    total_loss = 0.0
+    total_classification_loss = 0.0
+    sample_count = 0
+    predictions = []
+    targets = []
+    with torch.no_grad():
+        for global_features, lesion_features, y, _ in loader:
+            global_features = global_features.to(device, non_blocking=True)
+            lesion_features = lesion_features.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            with amp_context(device):
+                logits = base_model.classify_pooled_features(
+                    global_features,
+                    lesion_features,
+                )
+                classification_loss = criterion(logits, y)
+                loss = float(config.CLASSIFICATION_ALPHA) * classification_loss
+            batch_size = int(y.size(0))
+            total_loss += float(loss) * batch_size
+            total_classification_loss += float(classification_loss) * batch_size
+            sample_count += batch_size
+            predictions.extend(logits.argmax(dim=1).cpu().tolist())
+            targets.extend(y.cpu().tolist())
+
+    metastasis_index = CLASS_NAMES.index("metastasis")
+    metastasis_precision, metastasis_recall, metastasis_fbeta = (
+        class_precision_recall_fbeta(
+            targets,
+            predictions,
+            metastasis_index,
+            config.METASTASIS_F_BETA,
+        )
+    )
+    return ValidationResult(
+        loss=total_loss / max(sample_count, 1),
+        classification_loss=total_classification_loss / max(sample_count, 1),
+        segmentation_loss=0.0,
+        accuracy=float(accuracy_score(targets, predictions)),
+        macro_f1=float(
+            f1_score(targets, predictions, average="macro", zero_division=0)
+        ),
+        metastasis_precision=metastasis_precision,
+        metastasis_recall=metastasis_recall,
+        metastasis_fbeta=metastasis_fbeta,
+        positive_dice=float(config.FROZEN_SEGMENTATION_POSITIVE_DICE),
+        positive_voxel_precision=float(
+            config.FROZEN_SEGMENTATION_POSITIVE_PRECISION
+        ),
+        positive_voxel_recall=float(config.FROZEN_SEGMENTATION_POSITIVE_RECALL),
+        positive_complete_miss_rate=float(
+            config.FROZEN_SEGMENTATION_POSITIVE_MISS_RATE
+        ),
+        normal_false_positive_fraction=float(
+            getattr(config, "FROZEN_SEGMENTATION_NORMAL_FP_FRACTION", 0.0)
+        ),
+        normal_false_positive_volume_ml=float(
+            config.FROZEN_SEGMENTATION_NORMAL_MEAN_FP_VOLUME_ML
+        ),
+        normal_p95_false_positive_volume_ml=float(
+            config.FROZEN_SEGMENTATION_NORMAL_P95_FP_VOLUME_ML
+        ),
+        positive_mask_cases=int(config.FROZEN_SEGMENTATION_POSITIVE_CASES),
+        normal_mask_cases=int(config.FROZEN_SEGMENTATION_NORMAL_CASES),
+        nnunet_foreground_mean_dice=float(
+            config.FROZEN_SEGMENTATION_NNUNET_FOREGROUND_DICE
+        ),
+    )
 
 
 def validate(model, loader, criterion, config, stage, device):
@@ -800,8 +1003,12 @@ def classification_constraints_met(result, config):
     return (
         result.positive_dice >= float(config.CHECKPOINT_MIN_POSITIVE_DICE)
         and result.accuracy >= float(config.CHECKPOINT_MIN_ACCURACY)
+        and result.macro_f1
+        >= float(getattr(config, "CHECKPOINT_MIN_MACRO_F1", 0.0))
         and result.metastasis_precision
         >= float(config.CHECKPOINT_MIN_METASTASIS_PRECISION)
+        and result.metastasis_recall
+        >= float(getattr(config, "CHECKPOINT_MIN_METASTASIS_RECALL", 0.0))
     )
 
 
@@ -955,11 +1162,26 @@ def main(args):
     optimizer = build_optimizer(model, config)
     lr_scheduler = build_lr_scheduler(optimizer, config)
     model = model.to(device)
-    if device.type == "cuda" and torch.cuda.device_count() > 1:
+    cached_feature_mode = (
+        args.stage == "classification-warmup"
+        and getattr(config, "CLASSIFICATION_FEATURE_MODE", "direct")
+        == "sliding_cache"
+    )
+    if (
+        device.type == "cuda"
+        and torch.cuda.device_count() > 1
+        and not cached_feature_mode
+    ):
         print(f"Using DataParallel on {torch.cuda.device_count()} GPUs")
         model = nn.DataParallel(model)
+    elif cached_feature_mode and device.type == "cuda":
+        print(
+            "Sliding feature extraction uses the primary GPU; cached classifier "
+            "training does not benefit from DataParallel"
+        )
 
     classification_dataset = unwrap_dataset(train_loader.dataset)
+    validation_dataset = unwrap_dataset(val_loader.dataset)
     criterion, class_counts = build_classification_criterion(
         classification_dataset,
         config,
@@ -976,6 +1198,9 @@ def main(args):
     )
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = checkpoint_dir / f"fold{args.fold}_model_best.pth"
+    unconstrained_checkpoint_path = (
+        checkpoint_dir / f"fold{args.fold}_model_best_unconstrained.pth"
+    )
     latest_checkpoint_path = (
         checkpoint_dir / f"fold{args.fold}_model_latest.pth"
     )
@@ -1021,10 +1246,30 @@ def main(args):
         if hasattr(train_loader.batch_sampler, "epoch"):
             train_loader.batch_sampler.epoch = start_epoch - 1
         print(f"Resuming from: {latest_checkpoint_path} (epoch {start_epoch})")
-    elif checkpoint_path.exists() or latest_checkpoint_path.exists():
+    elif (
+        checkpoint_path.exists()
+        or unconstrained_checkpoint_path.exists()
+        or latest_checkpoint_path.exists()
+    ):
         raise FileExistsError(
             "Refusing to overwrite an existing fold checkpoint. Use --resume "
             f"or choose a new --output-root: {checkpoint_dir}"
+        )
+
+    feature_cache_metadata_by_split = None
+    if cached_feature_mode:
+        train_loader, val_loader, feature_cache_metadata_by_split = (
+            cached_feature_loaders(
+                model=model,
+                train_dataset=classification_dataset,
+                val_dataset=validation_dataset,
+                config=config,
+                output_root=args.output_root,
+                initialization_path=initialization_path,
+                fold=args.fold,
+                model_name=model_name,
+                device=device,
+            )
         )
 
     print(f"Stage            : {args.stage}")
@@ -1040,6 +1285,10 @@ def main(args):
     print(f"Checkpoint output: {checkpoint_path}")
     print(f"Class counts     : {class_counts.tolist()}")
     print(
+        "Classification features: "
+        f"{getattr(config, 'CLASSIFICATION_FEATURE_MODE', 'direct')}"
+    )
+    print(
         "Optimizer/LR      : "
         f"{getattr(config, 'OPTIMIZER', 'adamw')} / "
         f"{getattr(config, 'LR_SCHEDULER', 'none')}"
@@ -1047,18 +1296,31 @@ def main(args):
 
     for epoch in range(start_epoch, int(config.NUM_EPOCHS) + 1):
         current_lr = float(optimizer.param_groups[0]["lr"])
-        train_result = train_one_epoch(
-            model,
-            train_loader,
-            optimizer,
-            scaler,
-            criterion,
-            config,
-            args.stage,
-            device,
-            args.fold,
-            epoch,
-        )
+        if cached_feature_mode:
+            train_result = train_cached_classifier_one_epoch(
+                model,
+                train_loader,
+                optimizer,
+                scaler,
+                criterion,
+                config,
+                device,
+                args.fold,
+                epoch,
+            )
+        else:
+            train_result = train_one_epoch(
+                model,
+                train_loader,
+                optimizer,
+                scaler,
+                criterion,
+                config,
+                args.stage,
+                device,
+                args.fold,
+                epoch,
+            )
         validation_interval = max(
             1,
             int(getattr(config, "VALIDATE_EVERY_N_EPOCHS", 1)),
@@ -1077,14 +1339,23 @@ def main(args):
             if lr_scheduler is not None:
                 lr_scheduler.step()
             continue
-        val_result = validate(
-            model,
-            val_loader,
-            criterion,
-            config,
-            args.stage,
-            device,
-        )
+        if cached_feature_mode:
+            val_result = validate_cached_classifier(
+                model,
+                val_loader,
+                criterion,
+                config,
+                device,
+            )
+        else:
+            val_result = validate(
+                model,
+                val_loader,
+                criterion,
+                config,
+                args.stage,
+                device,
+            )
         reference_met = segmentation_reference_met(val_result, config)
         reference_text = (
             "n/a" if reference_met is None else str(reference_met).lower()
@@ -1124,6 +1395,16 @@ def main(args):
             best_epoch = epoch
             patience_counter = 0
             model_to_save = unwrap_model(model)
+            constraints_met = (
+                True
+                if args.stage == "segmentation"
+                else classification_constraints_met(val_result, config)
+            )
+            selected_checkpoint_path = (
+                checkpoint_path
+                if constraints_met
+                else unconstrained_checkpoint_path
+            )
             torch.save(
                 {
                     "model_state": model_to_save.state_dict(),
@@ -1138,13 +1419,17 @@ def main(args):
                     "fold": args.fold,
                     "epoch": epoch,
                     "validation": asdict(val_result),
+                    "selection_constraints_met": constraints_met,
                     "initialization_path": initialization_path,
                     "train_config_path": str(config.__config_path__),
                     "train_config": config_snapshot(config),
                     "dataset_root": str(dataset_root),
                     "class_counts": class_counts.tolist(),
+                    "classification_feature_cache": (
+                        feature_cache_metadata_by_split
+                    ),
                 },
-                checkpoint_path,
+                selected_checkpoint_path,
             )
         should_stop = False
         if (
@@ -1188,16 +1473,35 @@ def main(args):
                 "best_validation": (
                     asdict(best_result) if best_result is not None else None
                 ),
+                "best_selection_constraints_met": (
+                    args.stage == "segmentation"
+                    or (
+                        best_result is not None
+                        and classification_constraints_met(best_result, config)
+                    )
+                ),
                 "patience_counter": patience_counter,
                 "train_config_path": str(config.__config_path__),
                 "train_config": config_snapshot(config),
+                "classification_feature_cache": (
+                    feature_cache_metadata_by_split
+                ),
             },
             latest_checkpoint_path,
         )
         if should_stop:
             break
 
-    print(f"[Finished] Best checkpoint: {checkpoint_path}")
+    if args.stage == "segmentation" or (
+        best_result is not None
+        and classification_constraints_met(best_result, config)
+    ):
+        print(f"[Finished] Eligible best checkpoint: {checkpoint_path}")
+    else:
+        print(
+            "[Finished] No validation epoch met all classification constraints; "
+            f"best unconstrained checkpoint: {unconstrained_checkpoint_path}"
+        )
 
 
 if __name__ == "__main__":

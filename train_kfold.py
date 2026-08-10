@@ -50,6 +50,10 @@ from models.model_factory import (
     model_capabilities,
     required_train_config_fields,
 )
+from utils.class_aware_sampling import (
+    ClassAwareEpochSampler,
+    parse_deferred_resampling_config,
+)
 from utils.losses import ClassBalancedFocalLoss
 from utils.train_and_test import set_seed, load_pt_dataset
 
@@ -589,17 +593,48 @@ def main(args):
     metastasis_f_beta = float(
         getattr(config, "METASTASIS_F_BETA", 2.0)
     )
-    min_metastasis_precision = float(
+    min_val_accuracy_by_fold = getattr(
+        config,
+        "MIN_VAL_ACCURACY_BY_FOLD",
+        None,
+    )
+    if min_val_accuracy_by_fold is not None:
+        fold_value = min_val_accuracy_by_fold.get(
+            args.fold,
+            min_val_accuracy_by_fold.get(str(args.fold)),
+        )
+        if fold_value is None:
+            raise ValueError(
+                "MIN_VAL_ACCURACY_BY_FOLD must provide a value for "
+                f"fold {args.fold}"
+            )
+        min_val_accuracy = float(fold_value)
+    else:
+        min_val_accuracy = float(
+            getattr(
+                config,
+                "MIN_VAL_ACCURACY",
+                getattr(config, "HIERARCHICAL_MIN_VAL_ACCURACY", 0.0),
+            )
+        )
+    min_val_metastasis_precision = float(
         getattr(
             config,
-            "HIERARCHICAL_MIN_VAL_METASTASIS_PRECISION",
-            0.0,
+            "MIN_VAL_METASTASIS_PRECISION",
+            getattr(
+                config,
+                "HIERARCHICAL_MIN_VAL_METASTASIS_PRECISION",
+                0.0,
+            ),
         )
     )
     checkpoint_metric_tolerance = float(
         getattr(config, "CHECKPOINT_METRIC_TOLERANCE", 1e-4)
     )
-
+    deferred_resampling = parse_deferred_resampling_config(
+        getattr(config, "DEFERRED_CLASS_AWARE_RESAMPLING", None),
+        NUM_CLASSES,
+    )
     dataset_root = resolve_input_artifact_dir(args.data_root, "datasets")
     processed_data_root = infer_data_dir(args.data_root)
     ckpt_root = resolve_output_artifact_dir(args.output_root, "checkpoints")
@@ -629,10 +664,18 @@ def main(args):
         "TRAINABLE_MODEL_PARTS": trainable_model_parts,
         "CHECKPOINT_SELECTION_METRIC": checkpoint_selection_metric,
         "METASTASIS_F_BETA": metastasis_f_beta,
+        "MIN_VAL_ACCURACY": min_val_accuracy,
+        "MIN_VAL_ACCURACY_BY_FOLD": min_val_accuracy_by_fold,
+        "MIN_VAL_METASTASIS_PRECISION": min_val_metastasis_precision,
         "HIERARCHICAL_MIN_VAL_METASTASIS_PRECISION": (
-            min_metastasis_precision
+            min_val_metastasis_precision
         ),
         "CHECKPOINT_METRIC_TOLERANCE": checkpoint_metric_tolerance,
+        "DEFERRED_CLASS_AWARE_RESAMPLING": (
+            deferred_resampling.as_dict()
+            if deferred_resampling is not None
+            else None
+        ),
     })
     
     if args.seq is not None:
@@ -699,8 +742,51 @@ def main(args):
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
 
-    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
-    val_loader   = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
+    all_labels = (
+        train_set.labels.tolist()
+        if isinstance(train_set.labels, torch.Tensor)
+        else list(train_set.labels)
+    )
+    class_counts = torch.bincount(
+        torch.tensor(all_labels),
+        minlength=NUM_CLASSES,
+    )
+    total_samples = len(all_labels)
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+    )
+    class_aware_sampler = None
+    resampled_train_loader = None
+    if deferred_resampling is not None:
+        class_aware_sampler = ClassAwareEpochSampler(
+            all_labels,
+            deferred_resampling.target_class_probabilities,
+            num_samples=total_samples,
+            seed=SEED + current_fold * 100_000,
+        )
+        resampled_train_loader = DataLoader(
+            train_set,
+            batch_size=BATCH_SIZE,
+            shuffle=False,
+            sampler=class_aware_sampler,
+            num_workers=NUM_WORKERS,
+        )
+        print(
+            "Deferred Class-Aware Resampling: natural sampling through "
+            f"epoch {deferred_resampling.start_epoch - 1}; then target "
+            f"counts {list(class_aware_sampler.target_class_counts)} "
+            f"with {deferred_resampling.post_switch_loss}"
+        )
+    val_loader = DataLoader(
+        val_set,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+    )
 
     model = create_model(
         model_name,
@@ -752,7 +838,6 @@ def main(args):
         print("Segmentation Loss: disabled (head is frozen or SEG_ALPHA <= 0)")
     if classification_alpha <= 0:
         print("Classification Loss Contribution: disabled (alpha=0)")
-
     model = model.to(DEVICE)
 
     # 启用多卡 DataParallel
@@ -760,10 +845,15 @@ def main(args):
         print(f"Using {torch.cuda.device_count()} GPUs!")
         model = nn.DataParallel(model)
 
-    all_labels = train_set.labels.tolist() if isinstance(train_set.labels, torch.Tensor) else list(train_set.labels)
-    class_counts = torch.bincount(torch.tensor(all_labels), minlength=NUM_CLASSES)
-    total_samples = len(all_labels)
-    criterion = build_classification_criterion(class_counts, total_samples)
+    natural_criterion = build_classification_criterion(
+        class_counts,
+        total_samples,
+    )
+    resampled_criterion = (
+        nn.CrossEntropyLoss().to(DEVICE)
+        if deferred_resampling is not None
+        else None
+    )
     subtype_criterion = (
         build_subtype_criterion(class_counts)
         if use_subtype_loss
@@ -807,15 +897,52 @@ def main(args):
     best_model_path = ckpt_dir / f"fold{current_fold}_model_best.pth"
 
     for epoch in range(1, NUM_EPOCHS + 1):
+        resampling_active = (
+            deferred_resampling is not None
+            and epoch >= deferred_resampling.start_epoch
+        )
+        if resampling_active:
+            balanced_epoch = epoch - deferred_resampling.start_epoch
+            class_aware_sampler.set_epoch(balanced_epoch)
+            epoch_train_loader = resampled_train_loader
+            epoch_criterion = resampled_criterion
+            sampling_stage = "class_aware"
+        else:
+            epoch_train_loader = train_loader
+            epoch_criterion = natural_criterion
+            sampling_stage = "natural"
+
+        if (
+            deferred_resampling is not None
+            and epoch == deferred_resampling.start_epoch
+        ):
+            # Warm-up checkpoints are not valid candidates for the resampling
+            # experiment; restart selection so the final file necessarily
+            # reflects at least one class-aware epoch.
+            best_candidate = None
+            best_epoch = 0
+            patience_counter = 0
+            print(
+                "\n[Sampling Stage] Switched to class-aware resampling "
+                f"with epoch counts {list(class_aware_sampler.target_class_counts)}; "
+                "classification loss is now unweighted CrossEntropyLoss; "
+                "checkpoint selection restarted"
+            )
+
         # --- Train ---
         model.train()
         keep_frozen_modules_in_eval_mode(model)
         total_loss = 0.0
         train_correct = 0
         train_total = 0 
+        epoch_sample_counts = torch.zeros(NUM_CLASSES, dtype=torch.long)
         
         # 进度条
-        pbar = tqdm(train_loader, desc=f"Fold {current_fold} Ep {epoch}", leave=False)
+        pbar = tqdm(
+            epoch_train_loader,
+            desc=f"Fold {current_fold} Ep {epoch}",
+            leave=False,
+        )
         for x, y, mask, mask_flag, _ in pbar:
             x, y = x.to(DEVICE), y.to(DEVICE)
             mask, mask_flag = mask.to(DEVICE), mask_flag.to(DEVICE)
@@ -838,7 +965,10 @@ def main(args):
                 logits = outputs["classification"]
                 loss = logits.sum() * 0.0
                 if classification_alpha > 0:
-                    loss = loss + classification_alpha * criterion(logits, y)
+                    loss = (
+                        loss
+                        + classification_alpha * epoch_criterion(logits, y)
+                    )
 
                 if use_subtype_loss:
                     loss_subtype = compute_subtype_loss(
@@ -866,8 +996,12 @@ def main(args):
             _, predicted = torch.max(logits.data, 1)
             train_total += y.size(0)
             train_correct += (predicted == y).sum().item()
+            epoch_sample_counts += torch.bincount(
+                y.detach().cpu(),
+                minlength=NUM_CLASSES,
+            )
         
-        train_loss = total_loss / len(train_loader)
+        train_loss = total_loss / len(epoch_train_loader)
         train_acc = train_correct / train_total
 
                 # --- Val ---
@@ -907,7 +1041,7 @@ def main(args):
                     if classification_alpha > 0:
                         loss = (
                             loss
-                            + classification_alpha * criterion(logits, y)
+                            + classification_alpha * epoch_criterion(logits, y)
                         )
                     if use_subtype_loss:
                         loss = loss + SUBTYPE_ALPHA * compute_subtype_loss(
@@ -1026,11 +1160,7 @@ def main(args):
             if val_hierarchical_metastasis_metrics is not None
             else val_metastasis_metrics
         )
-        effective_selection_metric = (
-            checkpoint_selection_metric
-            if capabilities["subtype"]
-            else "macro_f1"
-        )
+        effective_selection_metric = checkpoint_selection_metric
         candidate = build_checkpoint_candidate(
             epoch=epoch,
             val_loss=val_loss,
@@ -1038,16 +1168,8 @@ def main(args):
             macro_f1=selection_macro_f1,
             metastasis_metrics=selection_metastasis_metrics,
             selection_metric=effective_selection_metric,
-            min_accuracy=(
-                HIERARCHICAL_MIN_VAL_ACCURACY
-                if capabilities["subtype"]
-                else 0.0
-            ),
-            min_metastasis_precision=(
-                min_metastasis_precision
-                if capabilities["subtype"]
-                else 0.0
-            ),
+            min_accuracy=min_val_accuracy,
+            min_metastasis_precision=min_val_metastasis_precision,
         )
 
         val_dice = np.mean(valid_seg_dices) if len(valid_seg_dices) > 0 else 0.0
@@ -1058,7 +1180,9 @@ def main(args):
             f"train_loss: {train_loss:.4f} | train_acc: {train_acc:.4f}   "
             f"val_loss: {val_loss:.4f} | val_acc: {val_acc:.4f} | "
             f"val_f1: {val_f1:.4f} | "
-            f"val_meta_recall: {val_metastasis_metrics['recall']:.4f}"
+            f"val_meta_recall: {val_metastasis_metrics['recall']:.4f} | "
+            f"sampling: {sampling_stage} "
+            f"{epoch_sample_counts.tolist()}"
         )
         if val_hierarchical_f1 is not None:
             constraint_status = "OK" if candidate.constraints_met else "BELOW"
@@ -1073,6 +1197,19 @@ def main(args):
                 f"{val_hierarchical_metastasis_metrics['recall']:.4f}"
                 f" | val_hier_meta_f{metastasis_f_beta:g}: "
                 f"{val_hierarchical_metastasis_metrics['fbeta']:.4f}"
+                f" | selection_constraint: {constraint_status}"
+            )
+        elif (
+            effective_selection_metric != "macro_f1"
+            or min_val_accuracy > 0
+            or min_val_metastasis_precision > 0
+        ):
+            constraint_status = "OK" if candidate.constraints_met else "BELOW"
+            log_line += (
+                f" | val_meta_precision: "
+                f"{val_metastasis_metrics['precision']:.4f}"
+                f" | val_meta_f{metastasis_f_beta:g}: "
+                f"{val_metastasis_metrics['fbeta']:.4f}"
                 f" | selection_constraint: {constraint_status}"
             )
         if use_segmentation_loss:
@@ -1145,13 +1282,17 @@ def main(args):
                     candidate.precision_constraint_met
                 ),
                 "meets_selection_constraints": candidate.constraints_met,
+                "min_val_accuracy": min_val_accuracy,
+                "min_val_metastasis_precision": (
+                    min_val_metastasis_precision
+                ),
                 "hierarchical_min_val_accuracy": (
-                    HIERARCHICAL_MIN_VAL_ACCURACY
+                    min_val_accuracy
                     if capabilities["subtype"]
                     else None
                 ),
                 "hierarchical_min_val_metastasis_precision": (
-                    min_metastasis_precision
+                    min_val_metastasis_precision
                     if capabilities["subtype"]
                     else None
                 ),
@@ -1163,6 +1304,13 @@ def main(args):
                 "model_name": model_name,
                 "model_capabilities": capabilities,
                 "classification_alpha": classification_alpha,
+                "sampling_stage": sampling_stage,
+                "sampled_class_counts": epoch_sample_counts.tolist(),
+                "class_aware_sampler": (
+                    class_aware_sampler.metadata()
+                    if resampling_active
+                    else None
+                ),
                 "subtype_loss": (
                     "weighted_cross_entropy"
                     if use_subtype_loss
@@ -1178,13 +1326,15 @@ def main(args):
                 "train_config_path": str(config.__config_path__),
                 "train_config": train_config_snapshot,
                 "dataset_root": str(dataset_root),
-                **get_classification_loss_metadata(criterion, class_counts),
+                **get_classification_loss_metadata(
+                    epoch_criterion,
+                    class_counts,
+                ),
             }, best_model_path)
             # 即使在 MIN_EPOCHS 内，也保存更好的模型
         else:
             if (
-                capabilities["subtype"]
-                and best_candidate is not None
+                best_candidate is not None
                 and not best_candidate.constraints_met
             ):
                 # 在尚未出现满足全部约束的候选前，不因 fallback 指标停训。

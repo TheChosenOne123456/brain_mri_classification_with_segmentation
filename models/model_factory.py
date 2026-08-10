@@ -5,6 +5,7 @@ from models.FoundationModelLesionAwareHierarchical import (
 )
 from models.FLAIRUNet3D import FLAIRUNet3D, FLAIRUNet3DNNUNet
 from models.FoundationModel_ori import FoundationModel as FoundationModelOri
+from models.MedicalNetResNet18 import MedicalNetResNet18
 from models.ResNet import ResNet10, ResNet18
 from models.cnn3d import Simple3DCNN
 
@@ -15,6 +16,7 @@ MODEL_CHOICES = (
     "ResNet18",
     "FoundationModel",
     "FoundationModel_ori",
+    "MedicalNetResNet18",
     "FoundationModelHierarchical",
     "FoundationModelLesionAwareHierarchical",
     "FLAIRUNet3D",
@@ -171,6 +173,7 @@ def create_model(model_name, num_classes, in_channels=1, sequence_id=None):
         "ResNet18": ResNet18,
         "FoundationModel": FoundationModel,
         "FoundationModel_ori": FoundationModelOri,
+        "MedicalNetResNet18": MedicalNetResNet18,
     }
     constructor = constructors[model_name]
     try:
