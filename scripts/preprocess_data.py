@@ -4,6 +4,7 @@
 '''
 import argparse
 import csv
+import hashlib
 import importlib.util
 import json
 import re
@@ -36,17 +37,49 @@ from utils.io import load_index, save_index, INDEX_FILE_NAME
 from utils.resample import resample_image, save_image
 from utils.intensity import normalize_intensity, zero_outside_mask
 from utils.spatial import center_crop_or_pad_with_meta, crop_or_pad_around_mask_with_meta
-from utils.brain_extraction import dilate_mask, extract_foreground_mask_hd_bet
-from utils.preprocess_qc import validate_preprocessed_image, validate_saved_file_size
+from utils.brain_extraction import (
+    dilate_mask,
+    extract_foreground_mask_hd_bet,
+    extract_foreground_mask_synthstrip,
+)
+from utils.preprocess_qc import (
+    validate_brain_extraction_input,
+    validate_preprocessed_image,
+    validate_saved_file_size,
+)
 
 
 ERROR_LOG_FIELDS = ["case_id", "case_key", "seq_id", "nii_file", "stage", "error"]
+
+SYNTHSTRIP_CONFIG_DEFAULTS = {
+    "SYNTHSTRIP_SCRIPT": None,
+    "SYNTHSTRIP_MODEL": None,
+    "SYNTHSTRIP_MODEL_SHA256": None,
+    "SYNTHSTRIP_DEVICE": "auto",
+    "SYNTHSTRIP_BORDER_MM": 1.0,
+    "SYNTHSTRIP_THREADS": None,
+    "SYNTHSTRIP_VERBOSE": False,
+}
+
+
+class BrainExtractionInputError(ValueError):
+    """输入影像为空或强度退化，不能安全送入脑提取模型。"""
+
+
+def sha256_file(path: Path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def apply_preprocessing_config(config):
     """让原有预处理函数继续使用同名常量，不改变图像处理核心逻辑。"""
     for name in PREPROCESS_CONFIG_FIELDS:
         globals()[name] = getattr(config, name)
+    for name, default in SYNTHSTRIP_CONFIG_DEFAULTS.items():
+        globals()[name] = getattr(config, name, default)
     globals()["PREPROCESS_CONFIG_PATH"] = str(config.__config_path__)
 
 
@@ -249,7 +282,7 @@ def make_preprocess_meta(nii_file, resampled_img, crop_meta, foreground_mask=Non
                 "voxel_count": int(coords.shape[0]),
             }
 
-    return {
+    meta = {
         "schema_version": 2,
         "preprocessing_config": PREPROCESS_CONFIG_PATH,
         "raw_image_path": str(Path(nii_file).resolve()),
@@ -262,6 +295,16 @@ def make_preprocess_meta(nii_file, resampled_img, crop_meta, foreground_mask=Non
         "crop": crop_meta,
         "foreground": foreground_meta,
     }
+    if BRAIN_EXTRACTOR == "synthstrip":
+        meta["synthstrip"] = {
+            "script": str(Path(SYNTHSTRIP_SCRIPT).expanduser().resolve()),
+            "model": str(Path(SYNTHSTRIP_MODEL).expanduser().resolve()),
+            "model_sha256": SYNTHSTRIP_MODEL_SHA256,
+            "device": SYNTHSTRIP_DEVICE,
+            "border_mm": float(SYNTHSTRIP_BORDER_MM),
+            "threads": SYNTHSTRIP_THREADS,
+        }
+    return meta
 
 
 def save_preprocess_meta(meta, meta_path: Path):
@@ -278,7 +321,49 @@ def validate_preprocess_setup():
             "in configs/global_config.py to use the legacy preprocessing flow."
         )
 
-    if BRAIN_EXTRACTOR not in {"hd-bet", "none"}:
+    if BRAIN_EXTRACTOR == "synthstrip":
+        if importlib.util.find_spec("surfa") is None:
+            raise RuntimeError(
+                "SynthStrip is selected but the 'surfa' package is not installed. "
+                "Install it with `python -m pip install surfa==0.6.3`."
+            )
+
+        if SYNTHSTRIP_SCRIPT is None or SYNTHSTRIP_MODEL is None:
+            raise ValueError(
+                "SynthStrip requires SYNTHSTRIP_SCRIPT and SYNTHSTRIP_MODEL in "
+                "the preprocessing config."
+            )
+
+        script_path = Path(SYNTHSTRIP_SCRIPT).expanduser().resolve()
+        model_path = Path(SYNTHSTRIP_MODEL).expanduser().resolve()
+        if not script_path.is_file():
+            raise FileNotFoundError(f"SynthStrip script not found: {script_path}")
+        if not model_path.is_file():
+            raise FileNotFoundError(f"SynthStrip model not found: {model_path}")
+
+        if SYNTHSTRIP_MODEL_SHA256:
+            digest = sha256_file(model_path)
+            if digest.lower() != str(SYNTHSTRIP_MODEL_SHA256).lower():
+                raise RuntimeError(
+                    "SynthStrip model SHA-256 mismatch: "
+                    f"expected {SYNTHSTRIP_MODEL_SHA256}, got {digest}"
+                )
+
+        if SYNTHSTRIP_DEVICE not in {"auto", "cpu", "cuda", "gpu"}:
+            raise ValueError(
+                f"Invalid SYNTHSTRIP_DEVICE: {SYNTHSTRIP_DEVICE}. "
+                "Expected 'auto', 'cpu', or 'cuda'."
+            )
+        if float(SYNTHSTRIP_BORDER_MM) < 0:
+            raise ValueError(
+                f"Invalid SYNTHSTRIP_BORDER_MM: {SYNTHSTRIP_BORDER_MM}"
+            )
+        if SYNTHSTRIP_THREADS is not None and int(SYNTHSTRIP_THREADS) <= 0:
+            raise ValueError(
+                f"Invalid SYNTHSTRIP_THREADS: {SYNTHSTRIP_THREADS}"
+            )
+
+    if BRAIN_EXTRACTOR not in {"hd-bet", "synthstrip", "none"}:
         raise ValueError(f"Unsupported brain extractor: {BRAIN_EXTRACTOR}")
 
     if INTENSITY_CLIP_PERCENTILES is not None:
@@ -306,7 +391,7 @@ def preprocess_image(nii_file):
     单个 NIfTI 的预处理入口。
 
     新流程：
-    resample -> HD-BET foreground mask -> mask 内归一化 -> mask 外置 0 -> 以 mask bbox 中心裁剪/填充。
+    resample -> configured foreground mask -> mask 内归一化 -> mask 外置 0 -> 以 mask bbox 中心裁剪/填充。
     旧流程可通过 global_config.py 中的 BRAIN_EXTRACTOR = "none" 回退。
     """
     resampled_img = resample_image(
@@ -323,15 +408,33 @@ def preprocess_image(nii_file):
         meta = make_preprocess_meta(nii_file, resampled_img, crop_meta, foreground_mask=None)
         return fixed_img, meta
 
-    foreground_mask = extract_foreground_mask_hd_bet(
-        resampled_img,
-        device=HD_BET_DEVICE,
-        mode=HD_BET_MODE,
-        do_tta=HD_BET_TTA,
-        postprocess=True,
-        target_orientation=HD_BET_TARGET_ORIENTATION,
-        verbose=HD_BET_VERBOSE,
-    )
+    if BRAIN_EXTRACTOR == "hd-bet":
+        foreground_mask = extract_foreground_mask_hd_bet(
+            resampled_img,
+            device=HD_BET_DEVICE,
+            mode=HD_BET_MODE,
+            do_tta=HD_BET_TTA,
+            postprocess=True,
+            target_orientation=HD_BET_TARGET_ORIENTATION,
+            verbose=HD_BET_VERBOSE,
+        )
+    else:
+        input_ok, input_reasons = validate_brain_extraction_input(
+            resampled_img,
+            max_zero_ratio=PREPROCESS_MAX_ZERO_RATIO,
+        )
+        if not input_ok:
+            raise BrainExtractionInputError(";".join(input_reasons))
+
+        foreground_mask = extract_foreground_mask_synthstrip(
+            resampled_img,
+            script_path=SYNTHSTRIP_SCRIPT,
+            model_path=SYNTHSTRIP_MODEL,
+            device=SYNTHSTRIP_DEVICE,
+            border_mm=SYNTHSTRIP_BORDER_MM,
+            threads=SYNTHSTRIP_THREADS,
+            verbose=SYNTHSTRIP_VERBOSE,
+        )
     foreground_mask = dilate_mask(foreground_mask, FOREGROUND_DILATION_MM)
 
     normalized_img = normalize_intensity(
@@ -513,13 +616,16 @@ def main(args):
 
             selected_files, _, missing_seq_ids = select_sequence_files(case_dir)
             if missing_seq_ids:
+                # 仅包含 seq4/seq5 等非目标序列时，T1/T2/FLAIR 会全部缺失。
+                # 这类目录不属于本项目输入范围，直接忽略，避免污染错误日志。
+                if len(missing_seq_ids) == NUM_SEQUENCES:
+                    continue
+
                 missing_names = [ALL_SEQUENCES[seq_id - 1] for seq_id in missing_seq_ids]
-                # 仅有 4/5 等非目标序列的目录会三序列全缺，数量较多，不在终端刷屏。
-                if len(missing_seq_ids) < NUM_SEQUENCES:
-                    tqdm.write(
-                        f"[Warning] Incomplete sequences, skip case: {case_dir.resolve()} | "
-                        f"missing: {','.join(missing_names)}"
-                    )
+                tqdm.write(
+                    f"[Warning] Incomplete sequences, skip case: {case_dir.resolve()} | "
+                    f"missing: {','.join(missing_names)}"
+                )
                 append_error_log(
                     error_log_path,
                     {
@@ -595,6 +701,25 @@ def main(args):
 
                     processed_images[seq_id] = fixed_img
                     preprocess_metas[seq_id] = preprocess_meta
+
+                except BrainExtractionInputError as e:
+                    tqdm.write(
+                        f"[Warning] Brain-extraction input QC failed: "
+                        f"{nii_file.resolve()} | ID: {case_id_str} | reasons: {e}"
+                    )
+                    append_error_log(
+                        error_log_path,
+                        {
+                            "case_id": case_id_str,
+                            "case_key": case_key,
+                            "seq_id": seq_id,
+                            "nii_file": str(nii_file.resolve()),
+                            "stage": "brain_extraction_input_qc",
+                            "error": str(e),
+                        },
+                    )
+                    case_ok = False
+                    break
 
                 except Exception as e:
                     tqdm.write(f"\n[Error] Unknown error processing {nii_file}: {e}")

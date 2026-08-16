@@ -1,7 +1,7 @@
 """外部独立数据集端到端验证。
 
 外部原始 NIfTI 会严格复用内部 ``preprocess_data.py`` 的预处理函数：
-resample -> HD-BET -> mask 内归一化 -> mask 外置零 -> 前景中心裁剪/填充。
+resample -> 配置的脑提取器 -> mask 内归一化 -> mask 外置零 -> 前景中心裁剪/填充。
 SimpleITK 数组直接以 [Z, Y, X] 转为 tensor，与内部 ``load_nii_as_tensor``
 最终得到的轴顺序完全一致。
 

@@ -153,6 +153,7 @@ dependencies:
       - scipy==1.13.1
       - simpleitk==2.5.3
       - six==1.17.0
+      - surfa==0.6.3
       - sympy==1.13.1
       - threadpoolctl==3.6.0
       - tqdm==4.67.1

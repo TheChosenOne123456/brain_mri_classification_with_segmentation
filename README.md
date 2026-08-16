@@ -3,7 +3,7 @@
 ## 项目概览
 本项目是一个基于3维MRI图像的分类任务，旨在帮助影像科医生区分脑膜疾病。具体而言，有三种病症：脑膜炎、脑炎和脑膜转移（转移瘤）。我们需要模型根据输入的MRI图像，给出分类结果。加上正常的案例，一共有四个类别。实际应用中，由于脑炎和脑膜炎同属炎症，区分起来很困难，且区分炎症和肿瘤更有医学上的意义，所以目前将数据中的脑膜炎和脑炎合并为炎症类，任务简化为三分类问题。
 
-项目使用 T1WI、T2WI、FLAIR 三种对齐序列。早期设想是将 FLAIR 序列上的医生标注 mask 迁移到 seq1、seq2、seq3，统一使用分类+分割双头模型训练；但实验发现，seq3 的 mask 辅助对 seq1 和 seq2 的分类效果不是正向收益。因此当前最优方案是：seq1、seq2 复用老项目中不涉及 mask 的 `FoundationModel_ori` 及其权重，seq3 使用带分类头和分割头的 `FoundationModel`，最后执行异构晚期融合软投票。
+项目使用 T1WI、T2WI、FLAIR 三种对齐序列。早期设想是将 FLAIR 序列上的医生标注 mask 迁移到 seq1、seq2、seq3，统一使用分类+分割双头模型训练；但实验发现，seq3 的 mask 辅助对 seq1 和 seq2 的分类效果不是正向收益。历史固定参照仍是 HD-BET 数据上的异构晚期融合；当前内部测试最佳工作点已经转为 SynthStrip 预处理管线：seq1、seq2 使用 `FoundationModel_ori`，seq3 在 `FoundationModel` 分类概率上叠加 OOF nnU-Net 病灶引导，再执行三序列等权软投票。最终病灶分割使用原生 nnU-Net，而不是 Foundation 的轻量分割头。
 
 ## 项目结构
 ```text
@@ -86,7 +86,7 @@
 4. scripts：必要的脚本实现，包含“数据预处理”“mask预处理”和“训练集、验证集和测试集的生成”
 5. train_kfold.py：训练脚本，配合k折交叉验证使用
 6. eval_kfold.py：单序列或多通道模型测试脚本，先计算每一折的结果，再综合评估
-7. eval.py：当前最优异构晚期融合软投票测试脚本；eval_vote_kfold.py保留为同构模型软投票评估脚本
+7. eval.py：基础异构晚期融合软投票测试脚本；`eval_foundation_nnunet_guided.py` 用于当前 SynthStrip guided 工作点的锁定评估，eval_vote_kfold.py保留为同构模型软投票评估脚本
 8. `train_meta_fusion.py`：使用跨折 OOF 概率选择三个非负模态权重和转移阈值；固定等权 normal gate，并对每个目标 fold 做无标签泄漏的 cross-fitted 评估
 9. infer.py / infer_kfold.py：预测脚本，支持临床晚期融合推理和k折单例推理
 10. `deprecated_train.py`：旧的非 K-Fold 训练入口，仅用于明确提示迁移到 `train_kfold.py`
@@ -145,11 +145,13 @@ cp output/runs-cross-entropy/train_config.py output/runs-focal-loss/train_config
 
 | 脚本 | 作用 | 用法示例 |
 |---|---|---|
+| `setup_synthstrip.py` | 下载官方 SynthStrip 命令脚本和模型，并校验模型 SHA-256 | `python -m scripts.setup_synthstrip --output-root output/data-synthstrip` |
 | `preprocess_data.py` | 预处理三序列 MRI，生成 `data/`、图像和 metadata | `python -m scripts.preprocess_data --config output/data-hdbet/preprocessing_config.py --output-root output/data-hdbet` |
 | `preprocess_mask.py` | 根据预处理 metadata 对齐医生 mask，并写入已有 `data/` | `python -m scripts.preprocess_mask --config output/data-hdbet/preprocessing_config.py --data-root output/data-hdbet` |
 | `build_dataset_kfold.py` | 对共有病例执行分层 K-Fold 划分，生成 `datasets/` | `python -m scripts.build_dataset_kfold --config output/data-hdbet/dataset_config.py --data-root output/data-hdbet --output-root output/data-hdbet` |
 | `check_dataset_kfold.py` | 读取各 fold 的 `.pt`，统计 train/val/test 类别分布 | `python -m scripts.check_dataset_kfold --data-root output/data-hdbet` |
 | `check_preprocessed_data.py` | 按预处理配置检查 shape、spacing、文件大小和序列完整性 | `python -m scripts.check_preprocessed_data --config output/data-hdbet/preprocessing_config.py --data-root output/data-hdbet` |
+| `check_brain_extraction_quality.py` | 检查脑提取前景体积、连通性、边界、跨序列一致性和病灶保留率，并生成原图叠加图 | `python -m scripts.check_brain_extraction_quality --config output/data-synthstrip/preprocessing_config.py --data-root output/data-synthstrip` |
 | `check_file_sizes.py` | 不读取体素，快速列出小于阈值的 NIfTI | `python -m scripts.check_file_sizes --data-root output/data-hdbet --threshold-mb 1` |
 | `delete_small_preprocessed_cases.py` | 按 case 清理异常小文件；默认仅 dry-run | `python -m scripts.delete_small_preprocessed_cases --data-root output/data-hdbet --threshold-mb 1` |
 | `get_raw_data_info.py` | 只读统计原始 NIfTI 的 size、spacing 和物理尺寸 | `python -m scripts.get_raw_data_info --raw-root /path/to/raw` |
@@ -157,10 +159,19 @@ cp output/runs-cross-entropy/train_config.py output/runs-focal-loss/train_config
 `deprecated_build_dataset.py` 和 `deprecated_check_dataset.py` 是无 K-Fold 的历史脚本，仅供追溯，不再维护或推荐执行。
 
 ### 数据预处理
-数据预处理有三个步骤：
+数据预处理有四个步骤：
 1. 重采样resample：统一输入图像的spacing,使像素物理意义一致
-2. 归一化normalize：统一输入图像的像素值区间，执行Z-score标准化，使平均值为0，标准差为1。这样能消除设备差异，减小不同机器这个因素对模型的干扰
-3. 裁剪/填充center_crop_or_pad：固定中心点，将重采样后的数据填充或裁剪至统一大小
+2. 脑区提取brain extraction：生成前景 mask，并按配置膨胀以减少脑膜邻近信息被切除的风险
+3. 归一化normalize：统一输入图像的像素值区间，执行Z-score标准化，使平均值为0，标准差为1。这样能消除设备差异，减小不同机器这个因素对模型的干扰
+4. 裁剪/填充crop_or_pad：以前景 bbox 中心为中心，将重采样后的数据填充或裁剪至统一大小
+
+脑区提取方法记录：
+
+- `HD-BET fast`：`output/data-hdbet` 当前历史基线，每个序列独立提取，关闭 TTA，随后统一膨胀 5 mm。
+- `SynthStrip`：`output/data-synthstrip` 对照实验，使用官方成人含 CSF 模型；其余 spacing、shape、归一化、外部清零、膨胀和裁剪参数与 HD-BET 基线保持一致。
+- `HD-BET accurate`：尚未执行，保留为以后可能的五模型集成/TTA 方向；必须使用新的 `output/data-*`，不能覆盖 `data-hdbet`。
+
+SynthStrip 调用前会检查非有限值、恒定强度、第 99 百分位无对比度及近乎全零的输入。此类源 NIfTI 无法安全归一化，会跳过整个病例并以 `brain_extraction_input_qc` 阶段写入 `data/preprocess_errors.csv`，不会把 NaN mask 保存为预处理结果。
 
 数据预处理结束后，会在指定实验根目录下生成 `data`，包含类别子目录、`case_index.json`、`mask_index.json`（执行 mask 预处理后）和每个序列的预处理 metadata。每项数据的命名方式是：`case_$(case_id)_$(seq_id).nii.gz`。结构如下：
 ```txt
@@ -185,6 +196,60 @@ output/data-hdbet/data
 python -m scripts.preprocess_data \
     --config output/data-hdbet/preprocessing_config.py \
     --output-root output/data-hdbet
+```
+
+首次运行 SynthStrip 前，安装其轻量 Python 依赖并下载官方脚本和模型。下载器会把文件放在被 Git 忽略的实验目录中，并校验模型 SHA-256：
+
+```bash
+conda activate BrainMRIClassification
+python -m pip install surfa==0.6.3
+python -m scripts.setup_synthstrip \
+    --output-root output/data-synthstrip
+```
+
+如果从默认 PyPI 遇到 `TLS/SSL connection has been closed (EOF)`，本服务器可改用已经验证过的清华镜像：
+
+```bash
+python -m pip install surfa==0.6.3 \
+    --index-url https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+如果当前终端设置了不可用的 HTTP(S) 代理，模型下载命令可追加 `--no-proxy`。随后运行独立的 SynthStrip 数据实验：
+
+```bash
+python -m scripts.preprocess_data \
+    --config output/data-synthstrip/preprocessing_config.py \
+    --output-root output/data-synthstrip
+
+python -m scripts.preprocess_mask \
+    --config output/data-synthstrip/preprocessing_config.py \
+    --data-root output/data-synthstrip
+```
+
+脑提取质量检查会把 CSV、JSON 摘要和默认 24 个可疑病例三平面叠加图写入
+`output/data-synthstrip/reports/brain_extraction_qc/`。红线是膨胀、裁剪后的前景边界，存在医生病灶 mask 时黄线表示病灶；建议先做少量 smoke check，再检查全部数据：
+
+```bash
+python -m scripts.check_brain_extraction_quality \
+    --config output/data-synthstrip/preprocessing_config.py \
+    --data-root output/data-synthstrip \
+    --max-cases 20 \
+    --num-overlays 12
+
+python -m scripts.check_brain_extraction_quality \
+    --config output/data-synthstrip/preprocessing_config.py \
+    --data-root output/data-synthstrip
+```
+
+该检查中的跨序列 Dice 只用于筛查明显差异，不等价于配准质量；厚层数据经常在 Z 轴两端仍有前景，因此脚本报告 Z 边界接触但默认不把它单独判为失败。
+
+确认 SynthStrip 预处理质量后，再构造与该实验绑定的 K-Fold 数据集：
+
+```bash
+python -m scripts.build_dataset_kfold \
+    --config output/data-synthstrip/dataset_config.py \
+    --data-root output/data-synthstrip \
+    --output-root output/data-synthstrip
 ```
 
 如果需要处理医生标注的mask数据，执行：
@@ -315,6 +380,83 @@ python train_kfold.py \
 ...
 ```
 
+SynthStrip 数据对应的同超参数基线位于 `output/runs-cross-entropy-synthstrip`。脚本默认训练 seq1/Fold 1；也可指定单序列五折或顺序执行全部 15 个任务。已有 checkpoint 默认跳过：
+
+```bash
+bash output/runs-cross-entropy-synthstrip/train.sh
+bash output/runs-cross-entropy-synthstrip/train.sh 3 all
+bash output/runs-cross-entropy-synthstrip/train.sh all all
+
+# 单独评估一个序列的全部五折；末尾可加 1～5 只评估指定 fold
+bash output/runs-cross-entropy-synthstrip/eval.sh seq1
+bash output/runs-cross-entropy-synthstrip/eval.sh seq2
+bash output/runs-cross-entropy-synthstrip/eval.sh seq3
+
+# checkpoint 齐全后评估全部五折三序列软投票
+bash output/runs-cross-entropy-synthstrip/eval.sh fusion all
+```
+
+该实验使用 SynthStrip 预处理后通过 QC 的全部 3606 例；历史 HD-BET 基线使用 3588 例，两者共有 3585 例，且共有病例只有约 31% 落在相同 test fold。因此当前结果适合作为“整套预处理管线”的对照，不是严格同病例、同 fold 的配对消融；若要归因到脑提取方法本身，应另建两套共有病例且共享 split 的数据实验并重新训练双方。
+
+#### SynthStrip 同配置基线的结果与定位
+
+| 数据与实验 | Accuracy | Macro-F1 | Metastasis P / R / F1 | 定位 |
+| --- | ---: | ---: | ---: | --- |
+| HD-BET：`output/runs-cross-entropy` | 0.9044 | 0.8683 | 0.8727 / 0.6946 / 0.7735 | 历史可靠基线，继续作为固定对照 |
+| SynthStrip：`output/runs-cross-entropy-synthstrip` | 0.9146 | 0.8805 | 0.9101 / 0.6990 / 0.7907 | 成功的预处理管线基线，作为后续模型优化的主要起点 |
+
+SynthStrip 管线的 pooled 融合结果在 Accuracy、Macro-F1 及转移 precision/F1 上均明确高于
+历史基线，转移 recall 则基本持平。其主要收益来自三序列互补性和更少的
+inflammation->metastasis 假阳性；三个单序列并非都稳定提高。结合病例集合与 fold 不完全
+一致，当前结论应表述为“新预处理、重新划分和重训组成的端到端管线是一次成功尝试”，
+不能单独证明 SynthStrip 是全部增益的原因。后续成功方向可优先以该数据管线为起点组合，
+但每次只改变一个主要因素，并继续用历史 HD-BET 结果作固定参照。
+
+已知数据治理待办：当前 `case_index` 只按原始末尾数字形成的 `case_key` 防止重复处理，
+不能识别编号不同但体素内容相同的检查。内容指纹检查发现 SynthStrip 数据中有 22 对（44
+个 case ID）至少一个序列完全相同，其中 19 对跨外层 fold；去除这些病例后的只读比较并
+不能解释本次性能提升，但只有重新分组训练才能严格排除影响。后续应为选中的 T1/T2/FLAIR
+计算体素内容指纹，任一序列完全相同的病例归入同一 duplicate group，并在 K-fold 中保证
+同组只进入一个外层 fold；三个序列均相同时可考虑只保留一个，标签冲突时必须人工核对，
+不在预处理阶段静默删除。
+
+#### SynthStrip + nnU-Net 引导的叠加结果
+
+SynthStrip 应视为一个**预处理与数据管线层面的优化大类**，而不是某个分类头的小改动。
+在此基础上，Dataset502 使用相同 SynthStrip FLAIR 和项目五折划分重新训练原生 nnU-Net；
+`output/runs-foundation-nnunet-guided-synthstrip` 冻结 SynthStrip Foundation 与 nnU-Net，
+仅训练 OOF soft-mask 特征上的 subtype expert。这样先固定新的数据管线，再验证模型级改动
+能否继续叠加，避免把脑提取、病例集合、fold 和模型结构的影响混在一次实验中。
+
+以下两行来自相同的 3606 例 SynthStrip 五折 locked test。`F2` 是更偏重召回率的 F-score：
+
+| 模型 | Accuracy | Macro-F1 | 转移 Precision | 转移 Recall | 转移 F2 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Foundation fusion | 0.9146 | 0.8805 | 0.9101 | 0.6990 | 0.7330 |
+| nnU-Net-guided fusion | **0.9157** | **0.8826** | 0.8985 | **0.7151** | **0.7456** |
+
+guided fusion 在转移 precision 下降 `1.16` 个百分点的同时，Accuracy、Macro-F1、转移
+Recall 和 F2 均提高；3606 例中只有 19 例发生最终融合改判，其中纠正 11 例、损害 7 例，
+净增加 4 例正确分类。五折 validation 选择的引导混合权重分别为
+`0.02/0.02/0/0.28/0.44`，Fold 3 因未满足保护约束自动回退 Foundation。因此该结果不是
+对全部病例大幅改写，而是在保留强 Foundation 基线的前提下小幅推动炎症/转移边界。按照
+“Accuracy 保持 0.90 以上并提高转移召回”的既定目标，它是当前内部测试最佳分类工作点；
+Foundation fusion 继续保留为转移 precision 更高的保守工作点。
+
+Dataset502 原生 nnU-Net 五折结果位于 `output/nnunet-flair-synthstrip`。SynthStrip guided
+五折训练与锁定评估命令为：
+
+```bash
+bash output/runs-foundation-nnunet-guided-synthstrip/train.sh
+bash output/runs-foundation-nnunet-guided-synthstrip/eval.sh
+```
+
+后续实验按两个层次组织：第一层固定 SynthStrip 数据、split 和 Foundation 基线；第二层再
+分别复现此前较成功的模型级方向，例如 lesion-aware/hierarchical subtype head、受约束
+温度缩放或 nnU-Net guidance。先做单因素复现，再研究 `SynthStrip + guidance + 层级边界`
+等组合，不假定旧 HD-BET checkpoint 或各项收益能够直接相加。所有混合系数、温度与约束
+继续只在 validation/OOF 上选择；本次 locked test 已用于最终开发记录，不再据此调参。
+
 层级模型使用现有 `output/data-hdbet`，不需要重新预处理或重建数据集。首轮配置为
 `SUBTYPE_ALPHA=0.5`、`SUBTYPE_CLASS_WEIGHT_POWER=0.5`、
 `HIERARCHICAL_MIN_VAL_ACCURACY=0.85`。这里的 0.85 是单序列验证准确率下限；旧基准的
@@ -364,6 +506,8 @@ test 不参与 checkpoint、阈值或超参数选择。阶段一会自动排除�
 | `output/runs-flair-unet-segmentation` | 原始 `FLAIRUNet3D`，阶段一：从头训练分割 | 5 折完整，作为结构/训练基线 |
 | `output/runs-flair-unet-nnunet-segmentation` | `FLAIRUNet3DNNUNet`，阶段一：导入 nnU-Net Fold 1 epoch-877 best | 当前有效分割初始化，含正确 validation 报告 |
 | `output/runs-foundation-nnunet-guided` | 冻结 Foundation 分类器 + OOF nnU-Net soft-mask subtype expert | 五折完成；锁定 test 显示为召回优先的小幅有效改进 |
+| `output/nnunet-flair-synthstrip` | SynthStrip Dataset502 原生 nnU-Net | 五折完成；当前病灶分割首选 |
+| `output/runs-foundation-nnunet-guided-synthstrip` | SynthStrip Foundation + Dataset502 OOF guidance | 五折完成；当前内部测试最佳分类工作点 |
 
 先只跑 Fold 1 的阶段一，确认 positive-case Dice、病灶体素 recall 和正常病例假阳性体素
 比例是否合理：
@@ -527,11 +671,14 @@ python eval_kfold.py \
 # eval_kfold 省略这三个参数时，默认使用迁移后的 data-hdbet 和 runs-cross-entropy
 python eval_kfold.py --seq 1 --model FoundationModel_ori
 
-# 当前最优异构晚期融合软投票评估
+# 历史 HD-BET 异构晚期融合固定对照
 python eval.py \
     --config output/runs-cross-entropy/train_config.py \
     --data-root output/data-hdbet \
     --checkpoint-root output/runs-cross-entropy
+
+# 当前 SynthStrip nnU-Net-guided 最佳工作点（五折 checkpoint 完成后）
+bash output/runs-foundation-nnunet-guided-synthstrip/eval.sh
 
 # 层级模型单序列评估：同时报告主头、层级输出和异常子类头指标
 python eval_kfold.py \
@@ -622,9 +769,9 @@ python train_meta_fusion.py \
   test     | 58              | 70              | 458             | 159             | 745 
 ```
 
-### 当前可靠综合基线
+### 历史可靠基线与当前最佳工作点
 
-当前默认和可靠综合基线位于 `output/runs-cross-entropy`。seq1/T1、seq2/T2 使用
+历史固定对照位于 `output/runs-cross-entropy`。seq1/T1、seq2/T2 使用
 `FoundationModel_ori`，seq3/FLAIR 使用带 mask 辅助分割头的 `FoundationModel`，三个
 模型的 FP32 三分类概率等权平均。下面使用当前 `output/data-hdbet` 划分和当前评估入口；
 每个病例只出现在一个 outer test fold 中，五折 pooled 共 3588 例：
@@ -660,9 +807,13 @@ metastasis precision/recall/F1/F2 为 `0.8727/0.6946/0.7735/0.7241`。pooled 混
 与当前每折 717–718 例、pooled 3588 例的病例集合并不一致，也不是当前
 `runs-cross-entropy/output_texts/fusion.txt` 的结果。由于旧记录缺少足够的数据版本
 provenance，不能把两个数值当作同一测试集上的模型升降；本节已经用当前产物和统一评估
-口径替换旧表。当前基线的主要瓶颈仍是将 metastasis 判为 inflammation（201 例）。若
-任务更重视转移召回，可并列考虑上一节的 nnU-Net guided fusion，但默认综合模型仍保持
-本基线。
+口径替换旧表。该基线的主要瓶颈仍是将 metastasis 判为 inflammation（201 例）。它继续
+承担跨历史实验的固定参照作用，但不再是当前点估计最高的工作点。当前分类首选是上一节的
+SynthStrip nnU-Net-guided fusion（Accuracy/Macro-F1/转移 Recall/F2 为
+`0.9157/0.8826/0.7151/0.7456`）；当前分割首选是
+`output/nnunet-flair-synthstrip` 的 Dataset502 原生 nnU-Net。由于两套预处理管线的病例
+集合和 fold 不完全一致，HD-BET 与 SynthStrip 之间只作端到端管线比较，不能解释为严格的
+单变量脑提取消融。
 
 ### 外部验证结果与泛化分析
 
@@ -703,20 +854,3 @@ python external_eval.py \
 2. 单独统计外部metastasis病例的metastasis概率分布，判断这些病例是完全被炎症压制，还是接近分类阈值。
 3. 在独立校准集上尝试温度校准、类别阈值调整、加权 soft voting，或以 metastasis recall 为优先目标选择融合权重。
 4. 如果能获得少量外部标注数据，优先做小规模域适配或微调，而不是只依赖内部K-fold结果。
-
-## 新特性：基于掩码（Mask）特征辅助的多任务学习网络
-
-在最新的迭代中，网络已由单分类任务演进为**分类与分割并行的多任务学习（Multi-task Learning）架构**。通过引入病灶区域的像素级标注（Mask），网络得以在训练期间学习到更聚焦的局部结构与轮廓特征，从机制上来讲，这能有效提升特征提取的质量并反哺主分类任务表现。
-
-### 双头网络设计 (Dual-head Architecture)
-目前的模型 `FoundationModel` 主要包含三个模块：
-1. **共享主干（Backbone）**：以3D ResNet（`official_r3d18` 等）作为骨干网络提取包含三维空间维度的深层特征图 `[B, C, D, H, W]`。
-2. **分类主分支（Classification Head）**：对共享特征图进行 3D 全局平均池化，随后展平传入全连接层进行全局的三分类（正常、炎症、转移瘤）。
-3. **分割辅助分支（Segmentation Head）**：由轻量级的 3D 卷积层和实例归一化（InstanceNorm3d）组建。该分支进一步提取病灶轮廓特征，并利用三线性插值（Trilinear Interpolation）将深层特征图等比放大回输入图像的原始尺寸，实现像素级输出。
-
-### 混合掩码数据训练策略
-在现实的医学影像场景下，获取所有数据的精细像素级 Mask 成本极高。因此，我们的训练机制进行了特别设计，以**兼容含 Mask 与无 Mask 的混合数据集**：
-- 对于**有 Mask 的案例**：计算分类损失（如 CrossEntropyLoss）的同时计算分割损失（如 Dice Loss 或 Pixel-wise CE），联合更新参数。
-- 对于**无 Mask 的案例**：仅执行分类分支的损失计算与反向传播。
-
-在模型执行推理或常规测试时，可通过控制参数 `return_seg=False` 动态关闭分割头的前向传播计算，从而保证分类场景下的推理速度与原来保持一致，无带来额外的显存/推理时间开销。

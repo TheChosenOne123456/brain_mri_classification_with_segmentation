@@ -1,15 +1,17 @@
 """
 脑部 foreground mask 生成工具。
 
-当前优先支持 HD-BET。HD-BET 的公开 Python API 以 NIfTI 路径为接口，
-因此这里用临时目录做包装：预处理过程中临时写入输入和 mask，读取后即删除。
-项目最终只保存模型需要的预处理图像。
+支持 HD-BET 和 SynthStrip。两者都以 NIfTI 路径为接口，因此这里用临时
+目录做包装：预处理过程中临时写入输入和 mask，读取后即删除。项目最终
+只保存模型需要的预处理图像。
 """
 
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import os
+import subprocess
+import sys
 
 import SimpleITK as sitk
 
@@ -150,6 +152,89 @@ def extract_foreground_mask_hd_bet(
             mask_img.CopyInformation(img)
 
         return mask_img
+
+
+def _resolve_synthstrip_gpu(device):
+    if device == "cpu":
+        return False
+    if device in {"cuda", "gpu"}:
+        return True
+    if device != "auto":
+        raise ValueError(
+            f"Unsupported SynthStrip device: {device}. "
+            "Expected 'auto', 'cpu', or 'cuda'."
+        )
+
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def extract_foreground_mask_synthstrip(
+    img: sitk.Image,
+    script_path,
+    model_path,
+    device="auto",
+    border_mm=1.0,
+    threads=None,
+    verbose=False,
+):
+    """使用官方 ``mri_synthstrip`` 脚本生成与 ``img`` 同网格的 brain mask。"""
+    script_path = Path(script_path).expanduser().resolve()
+    model_path = Path(model_path).expanduser().resolve()
+    use_gpu = _resolve_synthstrip_gpu(device)
+
+    with TemporaryDirectory(prefix="brain_mri_synthstrip_") as tmp_dir:
+        tmp_dir = Path(tmp_dir)
+        in_path = tmp_dir / "input.nii.gz"
+        mask_path = tmp_dir / "mask.nii.gz"
+        sitk.WriteImage(img, str(in_path))
+
+        command = [
+            sys.executable,
+            str(script_path),
+            "--image",
+            str(in_path),
+            "--mask",
+            str(mask_path),
+            "--model",
+            str(model_path),
+            "--border",
+            str(float(border_mm)),
+        ]
+        if use_gpu:
+            command.append("--gpu")
+        if threads is not None:
+            command.extend(["--threads", str(int(threads))])
+
+        completed = subprocess.run(
+            command,
+            check=False,
+            text=True,
+            stdout=None if verbose else subprocess.PIPE,
+            stderr=None if verbose else subprocess.PIPE,
+        )
+        if completed.returncode != 0:
+            details = ""
+            if not verbose:
+                output = "\n".join(
+                    part.strip()
+                    for part in (completed.stdout or "", completed.stderr or "")
+                    if part.strip()
+                )
+                details = f"\n{output[-4000:]}" if output else ""
+            raise RuntimeError(
+                f"SynthStrip failed with exit code {completed.returncode}.{details}"
+            )
+        if not mask_path.exists():
+            raise RuntimeError("SynthStrip did not produce the expected mask file.")
+
+        mask_img = sitk.ReadImage(str(mask_path))
+        mask_img = sitk.Cast(mask_img > 0, sitk.sitkUInt8)
+        return resample_mask_to_reference(mask_img, img)
 
 
 def dilate_mask(mask_img: sitk.Image, dilation_mm):
