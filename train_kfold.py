@@ -56,6 +56,10 @@ from utils.class_aware_sampling import (
 )
 from utils.losses import ClassBalancedFocalLoss
 from utils.train_and_test import set_seed, load_pt_dataset
+from utils.volume_augmentation import (
+    parse_volume_augmentation_config,
+    wrap_training_dataset,
+)
 
 import warnings
 warnings.filterwarnings("ignore", message="You are using `torch.load` with `weights_only=False`")
@@ -635,6 +639,9 @@ def main(args):
         getattr(config, "DEFERRED_CLASS_AWARE_RESAMPLING", None),
         NUM_CLASSES,
     )
+    train_augmentation = parse_volume_augmentation_config(
+        getattr(config, "TRAIN_AUGMENTATION", None)
+    )
     dataset_root = resolve_input_artifact_dir(args.data_root, "datasets")
     processed_data_root = infer_data_dir(args.data_root)
     ckpt_root = resolve_output_artifact_dir(args.output_root, "checkpoints")
@@ -676,6 +683,7 @@ def main(args):
             if deferred_resampling is not None
             else None
         ),
+        "TRAIN_AUGMENTATION": train_augmentation.as_dict(),
     })
     
     if args.seq is not None:
@@ -740,6 +748,12 @@ def main(args):
         base_ckpt_dir = ckpt_root
         ckpt_dir = base_ckpt_dir / "multi_channel" / model_name
         ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+
+    if train_augmentation.enabled:
+        train_set = wrap_training_dataset(train_set, train_augmentation)
+        print(f"Training Augmentation: {train_augmentation.as_dict()}")
+        print("Validation Augmentation: disabled")
 
 
     all_labels = (
